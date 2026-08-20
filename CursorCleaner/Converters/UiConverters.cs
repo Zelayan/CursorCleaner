@@ -64,6 +64,18 @@ public sealed class DataCategoryConverter : IValueConverter
     public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture) => Binding.DoNothing;
 }
 
+public sealed class SessionSourceConverter : IValueConverter
+{
+    public object Convert(object value, Type targetType, object parameter, CultureInfo culture) => value switch
+    {
+        SessionSource.File => "文件",
+        SessionSource.Database => "数据库",
+        SessionSource.Both => "文件+库",
+        _ => value?.ToString() ?? string.Empty
+    };
+    public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture) => Binding.DoNothing;
+}
+
 public sealed class ThemeConverter : IValueConverter
 {
     public object Convert(object value, Type targetType, object parameter, CultureInfo culture) => value switch

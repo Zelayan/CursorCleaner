@@ -146,10 +146,16 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         ScanCommand = new AsyncRelayCommand(token => TrackActivityAsync(() => ScanAsync(token)), () => !IsScanning && !IsBusy && !_closeRequested);
         CancelScanCommand = new RelayCommand(CancelScan, () => IsScanning);
         GeneratePreviewCommand = new RelayCommand(_ => GeneratePreview(null), _ => CanPreview);
-        GenerateSelectedSessionPreviewCommand = new RelayCommand(p => GeneratePreview(GetSelectedSessionPaths(p as IList)), p => CanPreview && HasSelectedSessions(p));
         GenerateSelectedWorkspacePreviewCommand = new RelayCommand(p => GeneratePreview(GetSelectedWorkspacePaths(p as IList)), p => CanPreview && HasSelectedWorkspaces(p));
+        DeleteSelectedSessionsCommand = new AsyncRelayCommand(
+            (parameter, token) => TrackActivityAsync(() => DeleteSelectedSessionsAsync(parameter, token)),
+            parameter => CanPreview && HasSelectedSessions(parameter) && !IsCleaning);
         CleanupCommand = new AsyncRelayCommand(token => TrackActivityAsync(() => CleanupAsync(token)), () => _cleanupPlan?.FileCount > 0 && !IsBusy && !IsScanning && !_closeRequested);
-        CancelCleanupCommand = new RelayCommand(() => CleanupCommand.Cancel(), () => IsCleaning);
+        CancelCleanupCommand = new RelayCommand(() =>
+        {
+            CleanupCommand.Cancel();
+            DeleteSelectedSessionsCommand.Cancel();
+        }, () => IsCleaning);
         VacuumCommand = new AsyncRelayCommand(token => TrackActivityAsync(() => VacuumAsync(token)), () => SelectedDatabase is not null && AdvancedToolsEnabled && !IsBusy && !IsScanning && !_closeRequested);
         OpenDirectoryCommand = new RelayCommand(OpenDirectory);
         OpenLogsCommand = new RelayCommand(() => TryShell(_shell.OpenLogs));
@@ -175,8 +181,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public AsyncRelayCommand ScanCommand { get; }
     public RelayCommand CancelScanCommand { get; }
     public RelayCommand GeneratePreviewCommand { get; }
-    public RelayCommand GenerateSelectedSessionPreviewCommand { get; }
     public RelayCommand GenerateSelectedWorkspacePreviewCommand { get; }
+    public AsyncRelayCommand DeleteSelectedSessionsCommand { get; }
     public AsyncRelayCommand CleanupCommand { get; }
     public RelayCommand CancelCleanupCommand { get; }
     public AsyncRelayCommand VacuumCommand { get; }
@@ -277,6 +283,17 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public bool ScanRoamingData { get => _settings.ScanRoamingData; set { if (_settings.ScanRoamingData != value) { _settings.ScanRoamingData = value; SettingsChanged(nameof(ScanRoamingData), true); } } }
     public bool ScanLocalData { get => _settings.ScanLocalData; set { if (_settings.ScanLocalData != value) { _settings.ScanLocalData = value; SettingsChanged(nameof(ScanLocalData), true); } } }
     public bool ScanUserProfile { get => _settings.ScanUserProfile; set { if (_settings.ScanUserProfile != value) { _settings.ScanUserProfile = value; SettingsChanged(nameof(ScanUserProfile), true); } } }
+    public bool AdvancedFeaturesEnabled
+    {
+        get => _settings.AdvancedFeaturesEnabled;
+        set
+        {
+            if (_settings.AdvancedFeaturesEnabled == value) return;
+            _settings.AdvancedFeaturesEnabled = value;
+            SettingsChanged(nameof(AdvancedFeaturesEnabled));
+            if (!value && SelectedPage is 2 or 3) SelectedPage = 5;
+        }
+    }
     public bool AdvancedToolsEnabled
     {
         get => _settings.AdvancedToolsEnabled;
@@ -479,28 +496,174 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         catch (Exception ex) { InvalidatePreview($"无法生成预览：{ex.Message}"); }
     }
 
-    private async Task CleanupAsync(CancellationToken token)
+    private async Task DeleteSelectedSessionsAsync(object? parameter, CancellationToken token)
     {
-        var plan = _cleanupPlan;
+        if (_scanResult is null) return;
+        var sessions = (parameter as IList)?.OfType<SessionInfo>().ToArray() ?? [];
+        if (sessions.Length == 0) return;
+        var filePaths = sessions
+            .Select(session => session.FilePath)
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var conversationIds = sessions
+            .SelectMany(session => session.DeletableConversationIds)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var databasePaths = GetChatDatabasePaths();
+
+        CleanupPlan? plan = null;
+        if (filePaths.Count > 0)
+        {
+            try
+            {
+                plan = _planner.CreateSelectedPlan(_scanResult, GetApprovedRoots(), filePaths);
+            }
+            catch (Exception ex)
+            {
+                OperationStatus = $"无法删除所选会话：{ex.Message}";
+                OperationStatusSeverity = StatusSeverity.Error;
+                if (!_closeRequested) await _dialogs.ShowErrorAsync("无法删除所选会话", ex.Message, token);
+                return;
+            }
+        }
+
+        var fileCount = plan?.FileCount ?? 0;
+        if (fileCount == 0 && conversationIds.Length == 0)
+        {
+            const string message = "所选会话没有可删除的文件，也没有可匹配的 SQLite 会话 ID。非 UUID 文件不会改数据库。";
+            OperationStatus = message;
+            OperationStatusSeverity = StatusSeverity.Warning;
+            if (!_closeRequested) await _dialogs.ShowErrorAsync("无法删除所选会话", message, token);
+            return;
+        }
+
+        if (_process.IsCursorRunning())
+        {
+            await _dialogs.ShowErrorAsync("无法删除所选会话", "Cursor 正在运行。请关闭 Cursor 后再删除所选会话。", token);
+            InvalidatePreview("Cursor 运行中，预览已失效");
+            return;
+        }
+
+        var mode = UseRecycleBin ? "回收站" : "永久删除";
+        var backup = AutomaticBackup ? "会话文件先自动备份" : "会话文件不创建备份";
+        var sqliteLine = conversationIds.Length == 0
+            ? "所选会话没有可匹配的 SQLite ID，不会修改数据库。"
+            : $"同时删除 SQLite 中 {conversationIds.Length:N0} 个会话 ID 的聊天记录；数据库会先做在线备份（不受文件备份开关影响）。";
+        var fileLine = fileCount == 0
+            ? "没有可回收的会话文件。"
+            : $"将处理 {fileCount:N0} 个会话文件，预计释放 {ByteSizeFormatter.Format(plan!.TotalSize)}。";
+        var confirmed = await _dialogs.ConfirmAsync(
+            "确认删除所选会话",
+            $"{fileLine}\n{sqliteLine}\n模式：{backup}，{mode}。\n请保持 Cursor 关闭。此操作只能执行一次，是否继续？",
+            token);
+        if (!confirmed) return;
+
+        IsBusy = true;
+        IsCleaning = true;
+        BusyText = "正在删除所选会话，取消后可能已有部分内容完成处理";
+        OperationStatus = "正在删除所选会话";
+        OperationStatusSeverity = StatusSeverity.Normal;
+        InvalidatePreview("正在执行清理，原预览已失效");
+        CleanupOperationResult? fileResult = null;
+        SqliteChatCleanupResult? sqliteResult = null;
+        try
+        {
+            if (conversationIds.Length > 0)
+            {
+                sqliteResult = await _sqlite.DeleteChatRecordsAsync(conversationIds, databasePaths, GetApprovedRoots(), token);
+                if (sqliteResult.Blocked)
+                {
+                    OperationStatus = $"SQLite 聊天删除被阻止：{sqliteResult.Error}";
+                    OperationStatusSeverity = StatusSeverity.Error;
+                    if (!_closeRequested)
+                        await _dialogs.ShowErrorAsync("无法删除所选会话", sqliteResult.Error ?? "Cursor 运行中，数据库未被修改。", CancellationToken.None);
+                    return;
+                }
+            }
+
+            if (fileCount > 0 && plan is not null)
+            {
+                fileResult = await _cleanup.ExecuteAsync(
+                    plan,
+                    true,
+                    new CleanupOptions(AutomaticBackup, UseRecycleBin ? CleanupDisposition.Recycle : CleanupDisposition.PermanentDelete),
+                    token);
+                CleanedFiles = fileResult.DeletedFiles;
+                CleanedBytes = fileResult.ReclaimedBytes;
+                if (fileResult.Blocked)
+                {
+                    OperationStatus = ComposeSessionDeleteStatus("清理被阻止", fileResult, sqliteResult);
+                    OperationStatusSeverity = StatusSeverity.Error;
+                    if (fileResult.Items.Count > 0)
+                        await RescanAfterCleanupAsync(fileResult, sqliteResult);
+                    if (!_closeRequested)
+                        await _dialogs.ShowErrorAsync("清理被阻止", fileResult.Error ?? "服务拒绝继续清理。", CancellationToken.None);
+                    return;
+                }
+            }
+
+            var outcome = fileResult?.Cancelled == true ? "清理已取消" : "清理完成";
+            OperationStatus = ComposeSessionDeleteStatus(outcome, fileResult, sqliteResult);
+            OperationStatusSeverity = fileResult?.Cancelled == true || (fileResult?.Items.Count(item => !item.Succeeded) > 0) || sqliteResult is { Succeeded: false }
+                ? StatusSeverity.Warning
+                : StatusSeverity.Success;
+            await RescanAfterCleanupAsync(fileResult ?? new CleanupOperationResult(plan?.Id ?? Guid.Empty, true, false, false, []), sqliteResult);
+        }
+        catch (OperationCanceledException)
+        {
+            OperationStatus = ComposeSessionDeleteStatus("清理已取消", fileResult, sqliteResult);
+            OperationStatusSeverity = StatusSeverity.Warning;
+            await RescanAfterCleanupAsync(
+                fileResult ?? new CleanupOperationResult(plan?.Id ?? Guid.Empty, false, false, true, [], "Cleanup was cancelled."),
+                sqliteResult);
+        }
+        catch (Exception ex)
+        {
+            OperationStatus = $"清理失败：{ex.Message}；可打开日志查看详情";
+            OperationStatusSeverity = StatusSeverity.Error;
+            await ReportErrorAsync("ui.cleanup", "清理失败", ex);
+        }
+        finally
+        {
+            IsCleaning = false;
+            IsBusy = false;
+            BusyText = string.Empty;
+            RaiseCommands();
+        }
+    }
+
+    private Task CleanupAsync(CancellationToken token) =>
+        ExecuteCleanupAsync(
+            _cleanupPlan,
+            "无法清理",
+            "Cursor 正在运行。请关闭 Cursor 后重新生成预览。",
+            "确认开始清理",
+            token);
+
+    private async Task ExecuteCleanupAsync(
+        CleanupPlan? plan,
+        string blockedTitle,
+        string cursorMessage,
+        string confirmTitle,
+        CancellationToken token)
+    {
         if (plan?.FileCount is not > 0) return;
         if (_process.IsCursorRunning())
         {
-            await _dialogs.ShowErrorAsync("无法清理", "Cursor 正在运行。请关闭 Cursor 后重新生成预览。", token);
+            await _dialogs.ShowErrorAsync(blockedTitle, cursorMessage, token);
             InvalidatePreview("Cursor 运行中，预览已失效");
             return;
         }
         var mode = UseRecycleBin ? "回收站" : "永久删除";
         var backup = AutomaticBackup ? "先自动备份" : "不创建备份";
-        var confirmed = await _dialogs.ConfirmAsync("确认开始清理", $"将处理 {plan.FileCount:N0} 个文件，预计释放 {ByteSizeFormatter.Format(plan.TotalSize)}。\n模式：{backup}，{mode}。\n此清理计划只能执行一次，是否继续？", token);
+        var confirmed = await _dialogs.ConfirmAsync(confirmTitle, $"将处理 {plan.FileCount:N0} 个文件，预计释放 {ByteSizeFormatter.Format(plan.TotalSize)}。\n模式：{backup}，{mode}。\n此清理计划只能执行一次，是否继续？", token);
         if (!confirmed) return;
         IsBusy = true;
         IsCleaning = true;
         BusyText = "正在清理，取消后可能已有部分文件完成处理";
         OperationStatus = "正在执行清理";
         OperationStatusSeverity = StatusSeverity.Normal;
-        _cleanupPlan = null;
-        OnPropertyChanged(nameof(HasCleanupPlan));
-        CleanupCommand.NotifyCanExecuteChanged();
+        InvalidatePreview("正在执行清理，原预览已失效");
         try
         {
             var result = await _cleanup.ExecuteAsync(plan, true, new CleanupOptions(AutomaticBackup, UseRecycleBin ? CleanupDisposition.Recycle : CleanupDisposition.PermanentDelete), token);
@@ -544,7 +707,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
-    private async Task RescanAfterCleanupAsync(CleanupOperationResult cleanupResult)
+    private async Task RescanAfterCleanupAsync(CleanupOperationResult cleanupResult, SqliteChatCleanupResult? sqliteResult = null)
     {
         var failedFiles = cleanupResult.Items.Count(item => !item.Succeeded);
         var token = _lifetimeCancellation.Token;
@@ -557,21 +720,47 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             CommitSnapshot(result, snapshot, true);
             LastScanText = result.CompletedAtUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss");
             var outcome = cleanupResult.Blocked ? "清理被阻止" : cleanupResult.Cancelled ? "清理已取消" : "清理完成";
-            OperationStatus = $"{outcome}：已删除 {cleanupResult.DeletedFiles:N0}，失败 {failedFiles:N0}，释放 {ByteSizeFormatter.Format(cleanupResult.ReclaimedBytes)}，当前占用 {ByteSizeFormatter.Format(CurrentUsage)}；可打开日志查看详情";
-            OperationStatusSeverity = cleanupResult.Blocked ? StatusSeverity.Error : cleanupResult.Cancelled || failedFiles > 0 ? StatusSeverity.Warning : StatusSeverity.Success;
+            OperationStatus = $"{ComposeSessionDeleteStatus(outcome, cleanupResult, sqliteResult)}，当前占用 {ByteSizeFormatter.Format(CurrentUsage)}；可打开日志查看详情";
+            OperationStatusSeverity = cleanupResult.Blocked || sqliteResult?.Blocked == true
+                ? StatusSeverity.Error
+                : cleanupResult.Cancelled || failedFiles > 0 || sqliteResult is { Succeeded: false }
+                    ? StatusSeverity.Warning
+                    : StatusSeverity.Success;
         }
         catch (OperationCanceledException) when (_closeRequested || _lifetimeCancellation.IsCancellationRequested)
         {
             var outcome = cleanupResult.Blocked ? "清理被阻止" : cleanupResult.Cancelled ? "清理已取消" : "清理完成";
-            OperationStatus = $"{outcome}：已删除 {cleanupResult.DeletedFiles:N0}，失败 {failedFiles:N0}，释放 {ByteSizeFormatter.Format(cleanupResult.ReclaimedBytes)}；重新扫描已取消，保留上次快照；可打开日志查看详情";
+            OperationStatus = $"{ComposeSessionDeleteStatus(outcome, cleanupResult, sqliteResult)}；重新扫描已取消，保留上次快照；可打开日志查看详情";
             OperationStatusSeverity = StatusSeverity.Warning;
         }
         catch (Exception ex)
         {
-            OperationStatus = $"清理结果：已删除 {cleanupResult.DeletedFiles:N0}，失败 {failedFiles:N0}，释放 {ByteSizeFormatter.Format(cleanupResult.ReclaimedBytes)}；重新扫描失败，保留上次快照；可打开日志查看详情";
+            OperationStatus = $"{ComposeSessionDeleteStatus("清理结果", cleanupResult, sqliteResult)}；重新扫描失败，保留上次快照；可打开日志查看详情";
             OperationStatusSeverity = StatusSeverity.Error;
             await TryLogAsync("error", "ui.cleanup.rescan", ex.Message, ex);
         }
+    }
+
+    private static string ComposeSessionDeleteStatus(
+        string outcome,
+        CleanupOperationResult? fileResult,
+        SqliteChatCleanupResult? sqliteResult)
+    {
+        var failedFiles = fileResult?.Items.Count(item => !item.Succeeded) ?? 0;
+        var filePart = fileResult is null
+            ? "未删除会话文件"
+            : $"已删除文件 {fileResult.DeletedFiles:N0}，失败 {failedFiles:N0}，释放 {ByteSizeFormatter.Format(fileResult.ReclaimedBytes)}";
+        var sqlitePart = sqliteResult is null
+            ? "未修改 SQLite"
+            : sqliteResult.Blocked
+                ? $"SQLite 被阻止：{sqliteResult.Error}"
+                : $"SQLite 删除 {sqliteResult.DeletedRows:N0} 行，失败库 {sqliteResult.FailedDatabases:N0}";
+        if (sqliteResult is { Succeeded: false, Error: not null } && !sqliteResult.Blocked)
+        {
+            sqlitePart += $"：{sqliteResult.Error}";
+        }
+
+        return $"{outcome}：{filePart}；{sqlitePart}";
     }
 
     private async Task VacuumAsync(CancellationToken token)
@@ -625,6 +814,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             ScanRoamingData = ScanRoamingData,
             ScanLocalData = ScanLocalData,
             ScanUserProfile = ScanUserProfile,
+            AdvancedFeaturesEnabled = AdvancedFeaturesEnabled,
             AdvancedToolsEnabled = AdvancedToolsEnabled,
             Theme = Theme
         };
@@ -655,7 +845,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             QueueSessionPreview(sessions.Length == 1 ? sessions[0] : null, sessions.Length);
         }
         if (selectedWorkspaces is not null) SelectedWorkspaceCount = selectedWorkspaces.OfType<WorkspaceInfo>().Count();
-        GenerateSelectedSessionPreviewCommand.NotifyCanExecuteChanged();
+        DeleteSelectedSessionsCommand.NotifyCanExecuteChanged();
         GenerateSelectedWorkspacePreviewCommand.NotifyCanExecuteChanged();
     }
 
@@ -703,12 +893,18 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         var category = SelectedCategory switch { "历史会话" => item.Category == DataCategory.ChatSession, "Workspace" => item.Category == DataCategory.Workspace, "SQLite" => item.Category == DataCategory.SQLite, "Agent Transcripts" => item.Category == DataCategory.AgentTranscript, "其他" => item.Category == DataCategory.Other, _ => true };
         return category && (string.IsNullOrWhiteSpace(SearchText) || item.FullPath.Contains(SearchText, StringComparison.CurrentCultureIgnoreCase));
     }
-    private bool FilterSession(object value) => value is SessionInfo s && (string.IsNullOrWhiteSpace(SessionProject) || SessionProject == AllProjects || string.Equals(s.ProjectName, SessionProject, StringComparison.CurrentCultureIgnoreCase)) && (string.IsNullOrWhiteSpace(SessionSearch) || s.Title.Contains(SessionSearch, StringComparison.CurrentCultureIgnoreCase) || (s.ProjectName?.Contains(SessionSearch, StringComparison.CurrentCultureIgnoreCase) ?? false) || s.FilePath.Contains(SessionSearch, StringComparison.CurrentCultureIgnoreCase));
+    private bool FilterSession(object value) => value is SessionInfo s && (string.IsNullOrWhiteSpace(SessionProject) || SessionProject == AllProjects || string.Equals(s.ProjectName, SessionProject, StringComparison.CurrentCultureIgnoreCase)) && (string.IsNullOrWhiteSpace(SessionSearch) || s.Title.Contains(SessionSearch, StringComparison.CurrentCultureIgnoreCase) || (s.ProjectName?.Contains(SessionSearch, StringComparison.CurrentCultureIgnoreCase) ?? false) || s.DisplayPath.Contains(SessionSearch, StringComparison.CurrentCultureIgnoreCase));
     private bool FilterWorkspace(object value) => value is WorkspaceInfo w && (string.IsNullOrWhiteSpace(WorkspaceSearch) || w.DisplayName.Contains(WorkspaceSearch, StringComparison.CurrentCultureIgnoreCase) || w.WorkspacePath.Contains(WorkspaceSearch, StringComparison.CurrentCultureIgnoreCase) || (w.ProjectPath?.Contains(WorkspaceSearch, StringComparison.CurrentCultureIgnoreCase) ?? false));
 
     private static bool HasSelectedSessions(object? parameter) => parameter is IList selected && selected.OfType<SessionInfo>().Any();
     private static bool HasSelectedWorkspaces(object? parameter) => parameter is IList selected && selected.OfType<WorkspaceInfo>().Any();
-    private static HashSet<string> GetSelectedSessionPaths(IList? selected) => selected?.OfType<SessionInfo>().Select(s => s.FilePath).ToHashSet(StringComparer.OrdinalIgnoreCase) ?? [];
+    private static HashSet<string> GetSelectedSessionPaths(IList? selected) => selected?.OfType<SessionInfo>().Select(s => s.FilePath).Where(path => !string.IsNullOrWhiteSpace(path)).ToHashSet(StringComparer.OrdinalIgnoreCase) ?? [];
+    private string[] GetChatDatabasePaths() =>
+        _scanResult?.Items
+            .Where(item => item.Category == DataCategory.SQLite && CursorChatSchema.IsChatDatabaseName(item.FullPath))
+            .Select(item => item.FullPath)
+            .Distinct(PathSafety.PathComparer)
+            .ToArray() ?? [];
     private HashSet<string> GetSelectedWorkspacePaths(IList? selected)
     {
         var prefixes = selected?.OfType<WorkspaceInfo>().Select(w => w.WorkspacePath).ToArray() ?? [];
@@ -824,7 +1020,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         SessionPreviewTruncated = false;
         Replace(SessionPreviewMessages, []);
         SessionPreviewTitle = session.Title;
-        SessionPreviewStatus = "正在只读加载会话内容";
+        SessionPreviewStatus = string.IsNullOrWhiteSpace(session.FilePath)
+            ? "该会话仅存在于 SQLite，当前只读预览不解析数据库正文。"
+            : "正在只读加载会话内容";
+        if (string.IsNullOrWhiteSpace(session.FilePath))
+        {
+            HasSessionPreview = false;
+            return;
+        }
+
         _sessionPreviewCancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetimeCancellation.Token);
         var token = _sessionPreviewCancellation.Token;
         _ = TrackActivityAsync(() => LoadSessionPreviewAsync(session, generation, token));
@@ -902,7 +1106,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     }
     private void NotifyAllSettings()
     {
-        foreach (var property in new[] { nameof(RetentionDays), nameof(AutomaticBackup), nameof(UseRecycleBin), nameof(ScanRoamingData), nameof(ScanLocalData), nameof(ScanUserProfile), nameof(AdvancedToolsEnabled), nameof(AdvancedToolsDisabled), nameof(Theme) }) OnPropertyChanged(property);
+        foreach (var property in new[] { nameof(RetentionDays), nameof(AutomaticBackup), nameof(UseRecycleBin), nameof(ScanRoamingData), nameof(ScanLocalData), nameof(ScanUserProfile), nameof(AdvancedFeaturesEnabled), nameof(AdvancedToolsEnabled), nameof(AdvancedToolsDisabled), nameof(Theme) }) OnPropertyChanged(property);
     }
     private void RefreshCursorState()
     {
@@ -916,8 +1120,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         ScanCommand.NotifyCanExecuteChanged();
         CancelScanCommand.NotifyCanExecuteChanged();
         GeneratePreviewCommand.NotifyCanExecuteChanged();
-        GenerateSelectedSessionPreviewCommand.NotifyCanExecuteChanged();
         GenerateSelectedWorkspacePreviewCommand.NotifyCanExecuteChanged();
+        DeleteSelectedSessionsCommand.NotifyCanExecuteChanged();
         CleanupCommand.NotifyCanExecuteChanged();
         CancelCleanupCommand.NotifyCanExecuteChanged();
         VacuumCommand.NotifyCanExecuteChanged();
@@ -950,7 +1154,23 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private void UpdateScanVisibleCount() => ScanVisibleCount = ScanItemsView.Cast<object>().Count();
     private void UpdateSessionVisibleCount() => SessionVisibleCount = SessionsView.Cast<object>().Count();
     private void UpdateWorkspaceVisibleCount() => WorkspaceVisibleCount = WorkspacesView.Cast<object>().Count();
-    private void OpenDirectory(object? parameter) { if (parameter is ScanItem item) TryShell(() => _shell.SelectFile(item.FullPath)); else if (parameter is LargeFileInfo large) TryShell(() => _shell.SelectFile(large.FullPath)); else if (parameter is WorkspaceInfo workspace) TryShell(() => _shell.OpenDirectory(workspace.WorkspacePath)); else if (parameter is SessionInfo session) TryShell(() => _shell.SelectFile(session.FilePath)); else if (parameter is string path && !string.IsNullOrWhiteSpace(path)) TryShell(() => _shell.OpenDirectory(Directory.Exists(path) ? path : Path.GetDirectoryName(path)!)); }
+    private void OpenDirectory(object? parameter)
+    {
+        if (parameter is ScanItem item) TryShell(() => _shell.SelectFile(item.FullPath));
+        else if (parameter is LargeFileInfo large) TryShell(() => _shell.SelectFile(large.FullPath));
+        else if (parameter is WorkspaceInfo workspace) TryShell(() => _shell.OpenDirectory(workspace.WorkspacePath));
+        else if (parameter is SessionInfo session)
+        {
+            var target = session.DisplayPath;
+            if (string.IsNullOrWhiteSpace(target)) return;
+            TryShell(() =>
+            {
+                if (File.Exists(target)) _shell.SelectFile(target);
+                else _shell.OpenDirectory(target);
+            });
+        }
+        else if (parameter is string path && !string.IsNullOrWhiteSpace(path)) TryShell(() => _shell.OpenDirectory(Directory.Exists(path) ? path : Path.GetDirectoryName(path)!));
+    }
     private async void TryShell(Action action) { try { action(); } catch (Exception ex) { await ReportErrorAsync("ui.shell", "无法打开路径", ex); } }
     private async Task ReportErrorAsync(string operation, string title, Exception ex)
     {

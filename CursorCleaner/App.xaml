@@ -16,6 +16,7 @@
             <conv:WorkspaceRecommendationConverter x:Key="WorkspaceRecommendationConverter"/>
             <conv:CategoryRecommendationConverter x:Key="CategoryRecommendationConverter"/>
             <conv:DataCategoryConverter x:Key="DataCategoryConverter"/>
+            <conv:SessionSourceConverter x:Key="SessionSourceConverter"/>
             <conv:ThemeConverter x:Key="ThemeConverter"/>
             <conv:UtcToLocalTimeConverter x:Key="UtcToLocalTimeConverter"/>
             <conv:SessionRoleBrushConverter x:Key="SessionRoleBrushConverter"/>

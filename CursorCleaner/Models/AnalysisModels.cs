@@ -10,6 +10,13 @@ public sealed record WorkspaceInfo(
     DateTime LastWriteTimeUtc,
     bool ProjectMissing);
 
+public enum SessionSource
+{
+    File,
+    Database,
+    Both
+}
+
 public sealed record SessionInfo(
     string Id,
     string FilePath,
@@ -17,7 +24,46 @@ public sealed record SessionInfo(
     string? ProjectName,
     DataCategory Category,
     long Size,
-    DateTime LastWriteTimeUtc);
+    DateTime LastWriteTimeUtc,
+    SessionSource Source = SessionSource.File,
+    string? DatabasePath = null,
+    IReadOnlyList<string>? ConversationIds = null)
+{
+    public string DisplayPath => !string.IsNullOrWhiteSpace(FilePath) ? FilePath : DatabasePath ?? string.Empty;
+
+    public IReadOnlyList<string> DeletableConversationIds
+    {
+        get
+        {
+            var ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (ConversationIds is not null)
+            {
+                foreach (var id in ConversationIds)
+                {
+                    if (SqliteConversationId.IsMatch(id))
+                    {
+                        ids.Add(id);
+                    }
+                }
+            }
+
+            if (SqliteConversationId.IsMatch(Id))
+            {
+                ids.Add(Id);
+            }
+
+            return ids.ToArray();
+        }
+    }
+}
+
+public static class SqliteConversationId
+{
+    public static bool IsMatch(string? value) =>
+        !string.IsNullOrWhiteSpace(value) &&
+        Guid.TryParse(value, out var guid) &&
+        guid != Guid.Empty;
+}
 
 public sealed record SessionMessage(string Role, string DisplayRole, string Text);
 

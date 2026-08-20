@@ -70,6 +70,49 @@ public sealed class AnalyzerTests
     }
 
     [TestMethod]
+    public async Task SessionAnalyzer_MergesSqliteComposerWithMatchingJsonl()
+    {
+        using var temp = new TemporaryDirectory();
+        var chats = Path.Combine(temp.Path, "projects", "demo", "agent-transcripts");
+        Directory.CreateDirectory(chats);
+        var composerId = "488ef4de-7b32-4b7c-b7be-6b67203f8717";
+        var transcript = Path.Combine(chats, composerId + ".jsonl");
+        await File.WriteAllTextAsync(transcript, """{"role":"user","composerId":"488ef4de-7b32-4b7c-b7be-6b67203f8717","text":"hi"}""");
+        var database = Path.Combine(temp.Path, "state.vscdb");
+        await SqliteChatFixtures.CreateStateDatabaseAsync(database, keepId: composerId, extraId: "dbe365e0-620f-4277-9f42-ab778a5749d9");
+        var result = CreateResult([
+            CreateItem(transcript, temp.Path, DataCategory.AgentTranscript),
+            CreateItem(database, temp.Path, DataCategory.SQLite)
+        ]);
+
+        var sessions = await new SessionAnalyzerService().AnalyzeAsync(result);
+
+        Assert.AreEqual(2, sessions.Count);
+        var merged = sessions.Single(session => session.Id == composerId);
+        Assert.AreEqual(SessionSource.Both, merged.Source);
+        Assert.AreEqual(transcript, merged.FilePath);
+        Assert.AreEqual(database, merged.DatabasePath);
+        Assert.AreEqual("Greeting conversation", merged.Title);
+        Assert.IsTrue(sessions.Any(session => session.Id == "dbe365e0-620f-4277-9f42-ab778a5749d9" && session.Source == SessionSource.Database));
+    }
+
+    [TestMethod]
+    public async Task SessionAnalyzer_ListsDatabaseOnlyComposerWithoutJsonl()
+    {
+        using var temp = new TemporaryDirectory();
+        var database = Path.Combine(temp.Path, "state.vscdb");
+        await SqliteChatFixtures.CreateStateDatabaseAsync(database, keepId: "488ef4de-7b32-4b7c-b7be-6b67203f8717", extraId: null);
+        var result = CreateResult([CreateItem(database, temp.Path, DataCategory.SQLite)]);
+
+        var sessions = await new SessionAnalyzerService().AnalyzeAsync(result);
+
+        Assert.AreEqual(1, sessions.Count);
+        Assert.AreEqual(SessionSource.Database, sessions[0].Source);
+        Assert.AreEqual(string.Empty, sessions[0].FilePath);
+        Assert.AreEqual("Greeting conversation", sessions[0].Title);
+    }
+
+    [TestMethod]
     public void ScanResultStore_RaisesChangeAndKeepsLatest()
     {
         var store = new ScanResultStore();

@@ -19,6 +19,7 @@ public sealed class OperationSettings
     public bool ScanLocalData { get; set; } = true;
     public bool ScanUserProfile { get; set; } = true;
     public bool AdvancedToolsEnabled { get; set; }
+    public bool AdvancedFeaturesEnabled { get; set; }
     public CleanerTheme Theme { get; set; } = CleanerTheme.System;
 }
 
@@ -107,6 +108,23 @@ public sealed record SqliteMaintenanceResult(
     public long ReclaimedBytes => Math.Max(0, SizeBefore - SizeAfter);
 }
 
+public sealed record SqliteChatDatabaseResult(
+    string DatabasePath,
+    bool Succeeded,
+    int DeletedRows,
+    string? BackupPath,
+    string? Error);
+
+public sealed record SqliteChatCleanupResult(
+    bool Succeeded,
+    bool Blocked,
+    IReadOnlyList<SqliteChatDatabaseResult> Databases,
+    string? Error)
+{
+    public int DeletedRows => Databases.Sum(item => item.DeletedRows);
+    public int FailedDatabases => Databases.Count(item => !item.Succeeded);
+}
+
 public interface IProcessService
 {
     bool IsCursorRunning();
@@ -128,6 +146,7 @@ public interface ISettingsService
 public interface ICleanupPlannerService
 {
     CleanupPlan CreatePlan(ScanResult scanResult, IEnumerable<string> approvedRoots, DateTime cutoffUtc);
+    CleanupPlan CreateSelectedPlan(ScanResult scanResult, IEnumerable<string> approvedRoots, IEnumerable<string> selectedPaths);
 }
 
 public interface IPathGuard
@@ -170,6 +189,12 @@ public interface IDialogService
 public interface ISqliteService
 {
     Task<SqliteMaintenanceResult> VacuumAsync(string databasePath, IEnumerable<string> approvedRoots, CancellationToken cancellationToken = default);
+
+    Task<SqliteChatCleanupResult> DeleteChatRecordsAsync(
+        IEnumerable<string> conversationIds,
+        IEnumerable<string> databasePaths,
+        IEnumerable<string> approvedRoots,
+        CancellationToken cancellationToken = default);
 }
 
 public interface ISessionContentService

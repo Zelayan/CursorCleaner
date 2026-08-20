@@ -1,4 +1,5 @@
 using System.IO;
+using System.Text.Json;
 using CursorCleaner.Helpers;
 using CursorCleaner.Models;
 using Microsoft.Data.Sqlite;
@@ -156,6 +157,178 @@ public sealed class SqliteService : ISqliteService
 
         await TryLogAsync("info", "sqlite.vacuum", $"Database maintenance completed; size changed from {sizeBefore} to {sizeAfter} bytes.", path, null).ConfigureAwait(false);
         return new SqliteMaintenanceResult(path, true, sizeBefore, sizeAfter, verifiedBackupPath, null);
+    }
+
+    public async Task<SqliteChatCleanupResult> DeleteChatRecordsAsync(
+        IEnumerable<string> conversationIds,
+        IEnumerable<string> databasePaths,
+        IEnumerable<string> approvedRoots,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(conversationIds);
+        ArgumentNullException.ThrowIfNull(databasePaths);
+        ArgumentNullException.ThrowIfNull(approvedRoots);
+
+        var ids = conversationIds
+            .Where(SqliteConversationId.IsMatch)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var roots = approvedRoots.Select(PathSafety.Normalize).Distinct(PathSafety.PathComparer).ToArray();
+        var paths = databasePaths
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .Select(PathSafety.Normalize)
+            .Distinct(PathSafety.PathComparer)
+            .ToArray();
+
+        if (ids.Length == 0)
+        {
+            return new SqliteChatCleanupResult(true, false, [], "没有可匹配的会话 ID，未修改 SQLite。");
+        }
+
+        if (paths.Length == 0)
+        {
+            return new SqliteChatCleanupResult(true, false, [], "没有可处理的聊天数据库，未修改 SQLite。");
+        }
+
+        if (_processService.IsCursorRunning())
+        {
+            return new SqliteChatCleanupResult(false, true, [], "Cursor is running; chat record deletion is blocked.");
+        }
+
+        var results = new List<SqliteChatDatabaseResult>();
+        foreach (var databasePath in paths)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (_processService.IsCursorRunning())
+            {
+                results.Add(new SqliteChatDatabaseResult(databasePath, false, 0, null, "Cursor started; remaining databases were not modified."));
+                continue;
+            }
+
+            results.Add(await DeleteFromDatabaseAsync(databasePath, ids, roots, cancellationToken).ConfigureAwait(false));
+        }
+
+        var blocked = results.Any(item => item.Error?.Contains("Cursor", StringComparison.OrdinalIgnoreCase) == true && !item.Succeeded);
+        var succeeded = results.Count > 0 && results.All(item => item.Succeeded);
+        var error = succeeded
+            ? null
+            : results.Where(item => !item.Succeeded).Select(item => item.Error).FirstOrDefault() ?? "SQLite chat deletion failed.";
+        return new SqliteChatCleanupResult(succeeded, blocked && !results.Any(item => item.Succeeded), results, error);
+    }
+
+    private async Task<SqliteChatDatabaseResult> DeleteFromDatabaseAsync(
+        string databasePath,
+        IReadOnlyList<string> ids,
+        IReadOnlyList<string> roots,
+        CancellationToken cancellationToken)
+    {
+        var guard = _pathGuard.ValidateSqliteTarget(databasePath, roots);
+        if (!guard.IsSafe)
+        {
+            return new SqliteChatDatabaseResult(databasePath, false, 0, null, guard.Error ?? "Database path validation failed.");
+        }
+
+        var path = guard.NormalizedPath!;
+        if (!_pathGuard.TryGetFileIdentity(path, out var initialIdentity, out var identityError))
+        {
+            return new SqliteChatDatabaseResult(path, false, 0, null, identityError ?? "Database identity verification failed.");
+        }
+
+        if (_processService.IsCursorRunning())
+        {
+            return new SqliteChatDatabaseResult(path, false, 0, null, "Cursor is running; chat record deletion is blocked.");
+        }
+
+        string? reservedBackupPath = null;
+        string? verifiedBackupPath = null;
+        try
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await using var connection = new SqliteConnection(BuildConnectionString(path, SqliteOpenMode.ReadWrite));
+            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+
+            guard = _pathGuard.ValidateSqliteTarget(path, roots);
+            if (!guard.IsSafe || !IdentityMatches(path, initialIdentity, out identityError))
+            {
+                return new SqliteChatDatabaseResult(path, false, 0, null, guard.Error ?? identityError ?? "Database changed while opening the write connection.");
+            }
+
+            if (_processService.IsCursorRunning())
+            {
+                return new SqliteChatDatabaseResult(path, false, 0, null, "Cursor started before chat deletion; no backup or write was performed.");
+            }
+
+            await RunQuickCheckAsync(connection, cancellationToken).ConfigureAwait(false);
+
+            var shape = await CursorChatSchema.DiscoverAsync(connection, cancellationToken).ConfigureAwait(false);
+            if (!shape.IsRecognized)
+            {
+                return new SqliteChatDatabaseResult(path, false, 0, null, "Database schema is not a recognized Cursor chat store; no rows were deleted.");
+            }
+
+            if (!await CursorChatSchema.HasChatDataAsync(connection, shape, cancellationToken).ConfigureAwait(false))
+            {
+                return new SqliteChatDatabaseResult(path, true, 0, null, "Skipped: no Cursor chat records were found.");
+            }
+
+            reservedBackupPath = await _backupService.CreateSqliteBackupPathAsync(path, cancellationToken).ConfigureAwait(false);
+            await using (var backupConnection = new SqliteConnection(BuildConnectionString(reservedBackupPath, SqliteOpenMode.ReadWriteCreate)))
+            {
+                await backupConnection.OpenAsync(cancellationToken).ConfigureAwait(false);
+                connection.BackupDatabase(backupConnection);
+                await RunQuickCheckAsync(backupConnection, cancellationToken).ConfigureAwait(false);
+            }
+
+            verifiedBackupPath = reservedBackupPath;
+
+            cancellationToken.ThrowIfCancellationRequested();
+            guard = _pathGuard.ValidateSqliteTarget(path, roots);
+            if (!guard.IsSafe || !IdentityMatches(path, initialIdentity, out identityError))
+            {
+                return new SqliteChatDatabaseResult(path, false, 0, verifiedBackupPath, guard.Error ?? identityError ?? "Database changed before chat deletion.");
+            }
+
+            if (_processService.IsCursorRunning())
+            {
+                return new SqliteChatDatabaseResult(path, false, 0, verifiedBackupPath, "Cursor started before chat deletion; the verified backup was kept and no write was started.");
+            }
+
+            var deleted = await CursorChatSchema.DeleteAsync(connection, shape, ids, cancellationToken).ConfigureAwait(false);
+            await TryLogAsync("info", "sqlite.chat.delete", $"Deleted {deleted} chat rows for {ids.Count} conversation IDs.", path, null).ConfigureAwait(false);
+            return new SqliteChatDatabaseResult(path, true, deleted, verifiedBackupPath, deleted == 0 ? "No matching chat rows were found." : null);
+        }
+        catch (OperationCanceledException)
+        {
+            if (verifiedBackupPath is null)
+            {
+                TryDeleteIncompleteBackup(reservedBackupPath);
+            }
+
+            return new SqliteChatDatabaseResult(path, false, 0, verifiedBackupPath, "Chat record deletion was cancelled before writes completed.");
+        }
+        catch (InvalidDataException ex)
+        {
+            if (verifiedBackupPath is null)
+            {
+                TryDeleteIncompleteBackup(reservedBackupPath);
+            }
+
+            await TryLogAsync("error", "sqlite.chat.quick_check", "Database integrity check failed.", path, ex).ConfigureAwait(false);
+            return new SqliteChatDatabaseResult(path, false, 0, verifiedBackupPath, $"Database or online backup failed quick_check: {ex.Message}");
+        }
+        catch (Exception ex) when (ex is SqliteException or IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException or JsonException)
+        {
+            if (verifiedBackupPath is null)
+            {
+                TryDeleteIncompleteBackup(reservedBackupPath);
+            }
+
+            await TryLogAsync("error", "sqlite.chat.delete", "Chat record deletion failed.", path, ex).ConfigureAwait(false);
+            var classification = ex is SqliteException sqliteException && sqliteException.SqliteErrorCode == 26
+                ? "Database is damaged or is not a SQLite database"
+                : "Database is locked or chat deletion failed";
+            return new SqliteChatDatabaseResult(path, false, 0, verifiedBackupPath, $"{classification}: {ex.Message}");
+        }
     }
 
     private bool IdentityMatches(string path, FileIdentity? expected, out string? error)

@@ -28,6 +28,33 @@ public sealed class OperationServiceTests
     }
 
     [TestMethod]
+    public void Planner_SelectedSessionsIgnoreCutoffAndExcludeNonSessions()
+    {
+        using var temp = new TemporaryDirectory();
+        var root = CreateRoot(temp.Path);
+        var cutoff = DateTime.UtcNow.AddDays(-30);
+        var recent = CreateFileItem(root, "projects/demo/chats/recent.json", DataCategory.ChatSession, DateTime.UtcNow);
+        var transcript = CreateFileItem(root, "projects/demo/agent-transcripts/run.jsonl", DataCategory.AgentTranscript, DateTime.UtcNow);
+        var workspace = CreateFileItem(root, "workspaceStorage/old.json", DataCategory.Workspace, cutoff.AddDays(-1));
+        var sqlite = CreateFileItem(root, "state.vscdb", DataCategory.SQLite, cutoff.AddDays(-1));
+        var planner = new CleanupPlannerService(new PathGuard([root.Path]));
+
+        var dated = planner.CreatePlan(CreateScanResult(recent, transcript, workspace, sqlite), [root.Path], cutoff);
+        var selected = planner.CreateSelectedPlan(
+            CreateScanResult(recent, transcript, workspace, sqlite),
+            [root.Path],
+            [recent.FullPath, transcript.FullPath, workspace.FullPath, sqlite.FullPath]);
+
+        Assert.AreEqual(1, dated.FileCount);
+        Assert.AreEqual(workspace.FullPath, dated.Items[0].FullPath);
+        Assert.AreEqual(2, selected.FileCount);
+        CollectionAssert.AreEquivalent(
+            new[] { recent.FullPath, transcript.FullPath },
+            selected.Items.Select(item => item.FullPath).ToArray());
+        Assert.IsTrue(selected.Items.All(item => item.Identity is not null));
+    }
+
+    [TestMethod]
     public void PathGuard_RejectsRootOutsideAndSqliteCleanup()
     {
         using var temp = new TemporaryDirectory();
@@ -300,6 +327,7 @@ public sealed class OperationServiceTests
         Assert.IsTrue(settings.AutomaticBackup);
         Assert.IsTrue(settings.UseRecycleBin);
         Assert.IsFalse(settings.AdvancedToolsEnabled);
+        Assert.IsFalse(settings.AdvancedFeaturesEnabled);
         Assert.AreEqual(CleanerTheme.System, settings.Theme);
         var log = Directory.GetFiles(logDirectory).Single();
         StringAssert.Contains(await File.ReadAllTextAsync(log), "settings.load");

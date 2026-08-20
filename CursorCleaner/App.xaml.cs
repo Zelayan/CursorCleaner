@@ -22,10 +22,10 @@ public partial class App : Application
         var pathService = new CursorPathService();
         var scanner = new CursorScannerService(pathService);
         var workspaceAnalyzer = new WorkspaceAnalyzerService();
-        var sessionAnalyzer = new SessionAnalyzerService();
         var store = new ScanResultStore();
         var process = new ProcessService();
         _log = new LogService();
+        var sessionAnalyzer = new SessionAnalyzerService(_log);
         var settings = new SettingsService(_log);
         var roots = pathService.GetDataRoots().Select(root => root.Path).ToArray();
         var pathGuard = new PathGuard(roots);

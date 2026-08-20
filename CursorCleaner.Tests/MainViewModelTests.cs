@@ -28,26 +28,26 @@ public sealed class MainViewModelTests
             var sessions = new ArrayList { session };
             var workspaces = new ArrayList { workspace };
             var allPreviewChanges = 0;
-            var sessionPreviewChanges = 0;
+            var deleteChanges = 0;
             var workspacePreviewChanges = 0;
             viewModel.GeneratePreviewCommand.CanExecuteChanged += (_, _) => allPreviewChanges++;
-            viewModel.GenerateSelectedSessionPreviewCommand.CanExecuteChanged += (_, _) => sessionPreviewChanges++;
+            viewModel.DeleteSelectedSessionsCommand.CanExecuteChanged += (_, _) => deleteChanges++;
             viewModel.GenerateSelectedWorkspacePreviewCommand.CanExecuteChanged += (_, _) => workspacePreviewChanges++;
 
             Assert.IsFalse(viewModel.GeneratePreviewCommand.CanExecute(null));
-            Assert.IsFalse(viewModel.GenerateSelectedSessionPreviewCommand.CanExecute(sessions));
+            Assert.IsFalse(viewModel.DeleteSelectedSessionsCommand.CanExecute(sessions));
             Assert.IsFalse(viewModel.GenerateSelectedWorkspacePreviewCommand.CanExecute(workspaces));
 
             await viewModel.ScanForTestingAsync();
 
             Assert.AreSame(result, store.Latest);
             Assert.IsTrue(viewModel.GeneratePreviewCommand.CanExecute(null));
-            Assert.IsFalse(viewModel.GenerateSelectedSessionPreviewCommand.CanExecute(new ArrayList()));
+            Assert.IsFalse(viewModel.DeleteSelectedSessionsCommand.CanExecute(new ArrayList()));
             Assert.IsFalse(viewModel.GenerateSelectedWorkspacePreviewCommand.CanExecute(new ArrayList()));
-            Assert.IsTrue(viewModel.GenerateSelectedSessionPreviewCommand.CanExecute(sessions));
+            Assert.IsTrue(viewModel.DeleteSelectedSessionsCommand.CanExecute(sessions));
             Assert.IsTrue(viewModel.GenerateSelectedWorkspacePreviewCommand.CanExecute(workspaces));
             Assert.IsTrue(allPreviewChanges > 0);
-            Assert.IsTrue(sessionPreviewChanges > 0);
+            Assert.IsTrue(deleteChanges > 0);
             Assert.IsTrue(workspacePreviewChanges > 0);
         });
     }
@@ -169,9 +169,14 @@ public sealed class MainViewModelTests
         await RunStaAsync(async () =>
         {
             var root = new CursorDataRoot(Path.GetTempPath(), RootKind.RoamingData, "test");
-            using var viewModel = CreateViewModel(new FixedScanner(Result(
-                Item(root, "a.db", DataCategory.SQLite),
-                Item(root, "b.json", DataCategory.ChatSession))), new ScanResultStore(), new FixedWorkspaceAnalyzer([]), new FixedSessionAnalyzer([]));
+            var session = new SessionInfo("s", Path.Combine(root.Path, "b.json"), "会话", "p", DataCategory.ChatSession, 10, DateTime.UtcNow);
+            using var viewModel = CreateViewModel(
+                new FixedScanner(Result(
+                    Item(root, "a.db", DataCategory.SQLite),
+                    Item(root, "b.json", DataCategory.ChatSession))),
+                new ScanResultStore(),
+                new FixedWorkspaceAnalyzer([]),
+                new FixedSessionAnalyzer([session]));
             var resetCount = 0;
             ((INotifyCollectionChanged)viewModel.ScanItems).CollectionChanged += (_, e) =>
             {
@@ -182,9 +187,10 @@ public sealed class MainViewModelTests
 
             Assert.AreEqual(1, resetCount);
             Assert.AreEqual(2, viewModel.ScanVisibleCount);
-            viewModel.SelectedCategory = "SQLite";
-            Assert.AreEqual(1, viewModel.ScanVisibleCount);
+            Assert.AreEqual(1, viewModel.SessionVisibleCount);
+            Assert.AreEqual("会话", viewModel.Sessions[0].Title);
             Assert.IsTrue(viewModel.HasScanResult);
+            Assert.IsFalse(viewModel.AdvancedFeaturesEnabled);
         });
     }
 
@@ -220,6 +226,98 @@ public sealed class MainViewModelTests
             Assert.AreEqual(1, viewModel.ScanItems.Count);
             Assert.AreEqual(remaining.FullPath, viewModel.ScanItems[0].FullPath);
             StringAssert.Contains(viewModel.OperationStatus, "清理已取消");
+        });
+    }
+
+    [TestMethod]
+    public async Task DeleteSelectedSessions_IgnoresRetentionAndConfirmsBeforeCleanup()
+    {
+        await RunStaAsync(async () =>
+        {
+            using var temp = new TemporaryDirectory();
+            var rootPath = Path.Combine(temp.Path, "Cursor");
+            Directory.CreateDirectory(rootPath);
+            var recentPath = Path.Combine(rootPath, "recent.json");
+            await File.WriteAllTextAsync(recentPath, "session");
+            var root = new CursorDataRoot(rootPath, RootKind.RoamingData, "test");
+            var recent = Item(root, "recent.json", DataCategory.ChatSession, DateTime.UtcNow);
+            var session = new SessionInfo("s", recent.FullPath, "最近会话", "p", DataCategory.ChatSession, 10, DateTime.UtcNow);
+            var remaining = Item(root, "remaining.json", DataCategory.ChatSession, DateTime.UtcNow);
+            var scanner = new RecordingScanner(Result(recent), Result(remaining));
+            var cleanup = new RecordingCleanupService();
+            var dialogs = new FixedDialogService(true);
+            var planner = new CapturingPlanner();
+            using var viewModel = CreateViewModel(
+                scanner,
+                new ScanResultStore(),
+                new FixedWorkspaceAnalyzer([]),
+                new FixedSessionAnalyzer([session]),
+                planner: planner,
+                cleanup: cleanup,
+                dialogs: dialogs,
+                pathService: new FixedPathService(root));
+
+            await viewModel.ScanForTestingAsync();
+            viewModel.SelectedPage = 1;
+
+            await viewModel.DeleteSelectedSessionsCommand.ExecuteAsync(new ArrayList { session });
+
+            Assert.AreEqual(recent.FullPath, planner.LastSelectedPaths.Single());
+            Assert.AreSame(planner.LastPlan, cleanup.LastPlan);
+            Assert.IsTrue(cleanup.LastConfirmed);
+            Assert.AreEqual(2, scanner.ScanCalls);
+            Assert.AreEqual(1, viewModel.SelectedPage);
+            StringAssert.Contains(dialogs.LastTitle, "确认删除所选会话");
+            StringAssert.Contains(dialogs.LastMessage!, "没有可匹配的 SQLite ID");
+            StringAssert.Contains(viewModel.OperationStatus, "清理已取消");
+        });
+    }
+
+    [TestMethod]
+    public async Task DeleteSelectedSessions_DatabaseOnlyDeletesSqliteWithoutFilePlan()
+    {
+        await RunStaAsync(async () =>
+        {
+            using var temp = new TemporaryDirectory();
+            var rootPath = Path.Combine(temp.Path, "Cursor");
+            Directory.CreateDirectory(rootPath);
+            var databasePath = Path.Combine(rootPath, "state.vscdb");
+            await File.WriteAllTextAsync(databasePath, "db");
+            var root = new CursorDataRoot(rootPath, RootKind.RoamingData, "test");
+            var database = Item(root, "state.vscdb", DataCategory.SQLite, DateTime.UtcNow);
+            var session = new SessionInfo(
+                "488ef4de-7b32-4b7c-b7be-6b67203f8717",
+                string.Empty,
+                "Greeting conversation",
+                "empty-window",
+                DataCategory.ChatSession,
+                0,
+                DateTime.UtcNow,
+                SessionSource.Database,
+                databasePath,
+                ["488ef4de-7b32-4b7c-b7be-6b67203f8717"]);
+            var scanner = new RecordingScanner(Result(database), Result(database));
+            var cleanup = new RecordingCleanupService();
+            var sqlite = new RecordingSqliteService();
+            var dialogs = new FixedDialogService(true);
+            using var viewModel = CreateViewModel(
+                scanner,
+                new ScanResultStore(),
+                new FixedWorkspaceAnalyzer([]),
+                new FixedSessionAnalyzer([session]),
+                cleanup: cleanup,
+                dialogs: dialogs,
+                pathService: new FixedPathService(root),
+                sqlite: sqlite);
+
+            await viewModel.ScanForTestingAsync();
+            await viewModel.DeleteSelectedSessionsCommand.ExecuteAsync(new ArrayList { session });
+
+            Assert.IsNull(cleanup.LastPlan);
+            CollectionAssert.AreEqual(new[] { "488ef4de-7b32-4b7c-b7be-6b67203f8717" }, sqlite.LastIds.ToArray());
+            CollectionAssert.AreEqual(new[] { databasePath }, sqlite.LastDatabasePaths.ToArray());
+            StringAssert.Contains(dialogs.LastMessage!, "SQLite");
+            Assert.AreEqual(2, scanner.ScanCalls);
         });
     }
 
@@ -296,7 +394,8 @@ public sealed class MainViewModelTests
         IDialogService? dialogs = null,
         ICleanupService? cleanup = null,
         ICursorPathService? pathService = null,
-        ISessionContentService? sessionContent = null)
+        ISessionContentService? sessionContent = null,
+        ISqliteService? sqlite = null)
     {
         pathService ??= new FixedPathService();
         return new(
@@ -304,7 +403,7 @@ public sealed class MainViewModelTests
             new FixedProcessService(), new NullLogService(), settings ?? new MemorySettingsService(),
             planner ?? new CleanupPlannerService(new PathGuard(pathService.GetDataRoots().Select(root => root.Path))),
             cleanup ?? new NullCleanupService(), new NullShellService(),
-            new NullSqliteService(), dialogs ?? new NullDialogService(),
+            sqlite ?? new NullSqliteService(), dialogs ?? new NullDialogService(),
             sessionContent ?? new NullSessionContentService());
     }
 
@@ -391,6 +490,18 @@ public sealed class MainViewModelTests
             Task.FromResult(new CleanupOperationResult(plan.Id, false, false, true, [], "Cleanup was cancelled before the next file."));
     }
 
+    private sealed class RecordingCleanupService : ICleanupService
+    {
+        public CleanupPlan? LastPlan { get; private set; }
+        public bool LastConfirmed { get; private set; }
+        public Task<CleanupOperationResult> ExecuteAsync(CleanupPlan plan, bool confirmed, CleanupOptions options, CancellationToken cancellationToken = default)
+        {
+            LastPlan = plan;
+            LastConfirmed = confirmed;
+            return Task.FromResult(new CleanupOperationResult(plan.Id, false, false, true, [], "Cleanup was cancelled before the next file."));
+        }
+    }
+
     private sealed class FixedWorkspaceAnalyzer(IReadOnlyList<WorkspaceInfo> result) : IWorkspaceAnalyzerService
     {
         public Task<IReadOnlyList<WorkspaceInfo>> AnalyzeAsync(ScanResult scanResult, CancellationToken cancellationToken = default) => Task.FromResult(result);
@@ -433,17 +544,44 @@ public sealed class MainViewModelTests
     private sealed class CapturingPlanner : ICleanupPlannerService
     {
         public DateTime CutoffUtc { get; private set; }
+        public IReadOnlyList<string> LastSelectedPaths { get; private set; } = [];
+        public CleanupPlan? LastPlan { get; private set; }
         public CleanupPlan CreatePlan(ScanResult scanResult, IEnumerable<string> approvedRoots, DateTime cutoffUtc)
         {
             CutoffUtc = cutoffUtc;
-            return new CleanupPlan(Guid.NewGuid(), DateTime.UtcNow, scanResult.Items.Select(item => new CleanupPlanItem(item.FullPath, item.RelativePath, item.Root, item.Category, item.Size, item.LastWriteTimeUtc)));
+            LastPlan = new CleanupPlan(Guid.NewGuid(), DateTime.UtcNow, scanResult.Items.Select(item => new CleanupPlanItem(item.FullPath, item.RelativePath, item.Root, item.Category, item.Size, item.LastWriteTimeUtc)));
+            return LastPlan;
+        }
+
+        public CleanupPlan CreateSelectedPlan(ScanResult scanResult, IEnumerable<string> approvedRoots, IEnumerable<string> selectedPaths)
+        {
+            LastSelectedPaths = selectedPaths.ToArray();
+            var selected = LastSelectedPaths.ToHashSet(StringComparer.OrdinalIgnoreCase);
+            LastPlan = new CleanupPlan(
+                Guid.NewGuid(),
+                DateTime.UtcNow,
+                scanResult.Items
+                    .Where(item => selected.Contains(item.FullPath))
+                    .Select(item => new CleanupPlanItem(item.FullPath, item.RelativePath, item.Root, item.Category, item.Size, item.LastWriteTimeUtc)));
+            return LastPlan;
         }
     }
     private sealed class FixedDialogService(bool answer) : IDialogService
     {
+        public string? LastTitle { get; private set; }
         public string? LastMessage { get; private set; }
-        public Task<bool> ConfirmAsync(string title, string message, CancellationToken cancellationToken = default) { LastMessage = message; return Task.FromResult(answer); }
-        public Task ShowErrorAsync(string title, string message, CancellationToken cancellationToken = default) => Task.CompletedTask;
+        public Task<bool> ConfirmAsync(string title, string message, CancellationToken cancellationToken = default)
+        {
+            LastTitle = title;
+            LastMessage = message;
+            return Task.FromResult(answer);
+        }
+        public Task ShowErrorAsync(string title, string message, CancellationToken cancellationToken = default)
+        {
+            LastTitle = title;
+            LastMessage = message;
+            return Task.CompletedTask;
+        }
     }
     private sealed class NullCleanupService : ICleanupService
     {
@@ -458,6 +596,21 @@ public sealed class MainViewModelTests
     private sealed class NullSqliteService : ISqliteService
     {
         public Task<SqliteMaintenanceResult> VacuumAsync(string databasePath, IEnumerable<string> approvedRoots, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<SqliteChatCleanupResult> DeleteChatRecordsAsync(IEnumerable<string> conversationIds, IEnumerable<string> databasePaths, IEnumerable<string> approvedRoots, CancellationToken cancellationToken = default) =>
+            Task.FromResult(new SqliteChatCleanupResult(true, false, [], null));
+    }
+
+    private sealed class RecordingSqliteService : ISqliteService
+    {
+        public IReadOnlyList<string> LastIds { get; private set; } = [];
+        public IReadOnlyList<string> LastDatabasePaths { get; private set; } = [];
+        public Task<SqliteMaintenanceResult> VacuumAsync(string databasePath, IEnumerable<string> approvedRoots, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<SqliteChatCleanupResult> DeleteChatRecordsAsync(IEnumerable<string> conversationIds, IEnumerable<string> databasePaths, IEnumerable<string> approvedRoots, CancellationToken cancellationToken = default)
+        {
+            LastIds = conversationIds.ToArray();
+            LastDatabasePaths = databasePaths.ToArray();
+            return Task.FromResult(new SqliteChatCleanupResult(true, false, [new SqliteChatDatabaseResult(LastDatabasePaths.FirstOrDefault() ?? string.Empty, true, 3, null, null)], null));
+        }
     }
     private sealed class NullSessionContentService : ISessionContentService
     {

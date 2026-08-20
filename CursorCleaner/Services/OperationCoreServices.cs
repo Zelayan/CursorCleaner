@@ -186,6 +186,12 @@ public sealed class CleanupPlannerService : ICleanupPlannerService
         DataCategory.AgentTranscript
     ];
 
+    public static readonly DataCategory[] SessionCategories =
+    [
+        DataCategory.ChatSession,
+        DataCategory.AgentTranscript
+    ];
+
     private readonly IPathGuard _pathGuard;
 
     public CleanupPlannerService(IPathGuard pathGuard)
@@ -196,6 +202,36 @@ public sealed class CleanupPlannerService : ICleanupPlannerService
     public CleanupPlan CreatePlan(ScanResult scanResult, IEnumerable<string> approvedRoots, DateTime cutoffUtc)
     {
         ArgumentNullException.ThrowIfNull(scanResult);
+        return Create(scanResult, approvedRoots, item =>
+            AllowedCategories.Contains(item.Category) && item.LastWriteTimeUtc < cutoffUtc);
+    }
+
+    public CleanupPlan CreateSelectedPlan(
+        ScanResult scanResult,
+        IEnumerable<string> approvedRoots,
+        IEnumerable<string> selectedPaths)
+    {
+        ArgumentNullException.ThrowIfNull(scanResult);
+        ArgumentNullException.ThrowIfNull(selectedPaths);
+        var selected = selectedPaths
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .Select(PathSafety.Normalize)
+            .ToHashSet(PathSafety.PathComparer);
+        if (selected.Count == 0)
+        {
+            return new CleanupPlan(Guid.NewGuid(), DateTime.UtcNow, []);
+        }
+
+        return Create(scanResult, approvedRoots, item =>
+            SessionCategories.Contains(item.Category) &&
+            selected.Contains(PathSafety.Normalize(item.FullPath)));
+    }
+
+    private CleanupPlan Create(
+        ScanResult scanResult,
+        IEnumerable<string> approvedRoots,
+        Func<ScanItem, bool> match)
+    {
         ArgumentNullException.ThrowIfNull(approvedRoots);
         var roots = approvedRoots.Select(PathSafety.Normalize).Distinct(PathSafety.PathComparer).ToArray();
         if (roots.Length == 0)
@@ -204,8 +240,7 @@ public sealed class CleanupPlannerService : ICleanupPlannerService
         }
 
         var items = scanResult.Items
-            .Where(item => AllowedCategories.Contains(item.Category))
-            .Where(item => item.LastWriteTimeUtc < cutoffUtc)
+            .Where(match)
             .Where(item => item.Size >= 0)
             .Where(item => roots.Any(root => IsSafeFileSnapshot(item, root)))
             .GroupBy(item => PathSafety.Normalize(item.FullPath), PathSafety.PathComparer)
