@@ -1,7 +1,5 @@
 using System.Collections;
 using System.Collections.Specialized;
-using System.Globalization;
-using CursorCleaner.Converters;
 using CursorCleaner.Helpers;
 using CursorCleaner.Models;
 using CursorCleaner.Services;
@@ -322,17 +320,30 @@ public sealed class MainViewModelTests
     }
 
     [TestMethod]
-    public void Converters_ReturnChineseAndLocalTime()
+    public void DisplayText_ReturnsChineseLabels()
     {
-        var category = new DataCategoryConverter();
-        var theme = new ThemeConverter();
-        var local = new UtcToLocalTimeConverter();
-        var culture = CultureInfo.GetCultureInfo("zh-CN");
         var utc = new DateTime(2026, 8, 20, 12, 30, 0, DateTimeKind.Utc);
 
-        Assert.AreEqual("历史会话", category.Convert(DataCategory.ChatSession, typeof(string), null!, culture));
-        Assert.AreEqual("跟随系统", theme.Convert(CleanerTheme.System, typeof(string), null!, culture));
-        Assert.AreEqual(utc.ToLocalTime().ToString("yyyy-MM-dd HH:mm", culture), local.Convert(utc, typeof(string), null!, culture));
+        Assert.AreEqual("历史会话", DisplayText.Category(DataCategory.ChatSession));
+        Assert.AreEqual("跟随系统", DisplayText.Theme(CleanerTheme.System));
+        Assert.AreEqual("可按会话删除", DisplayText.Recommendation(DataCategory.ChatSession));
+        Assert.AreEqual("项目路径已不存在，可考虑清理", DisplayText.WorkspaceRecommendation(true));
+        Assert.AreEqual(utc.ToLocalTime().ToString("yyyy-MM-dd HH:mm"), DisplayText.LocalTime(utc));
+    }
+
+    [TestMethod]
+    public void AdvancedFlags_ClampHiddenPagesToSettings()
+    {
+        using var viewModel = CreateViewModel(new FixedScanner(Result()), new ScanResultStore(), new FixedWorkspaceAnalyzer([]), new FixedSessionAnalyzer([]));
+        viewModel.AdvancedFeaturesEnabled = true;
+        viewModel.SelectedPage = 3;
+        viewModel.AdvancedFeaturesEnabled = false;
+        Assert.AreEqual(5, viewModel.SelectedPage);
+
+        viewModel.AdvancedToolsEnabled = true;
+        viewModel.SelectedPage = 4;
+        viewModel.AdvancedToolsEnabled = false;
+        Assert.AreEqual(5, viewModel.SelectedPage);
     }
 
     [TestMethod]
@@ -404,7 +415,8 @@ public sealed class MainViewModelTests
             planner ?? new CleanupPlannerService(new PathGuard(pathService.GetDataRoots().Select(root => root.Path))),
             cleanup ?? new NullCleanupService(), new NullShellService(),
             sqlite ?? new NullSqliteService(), dialogs ?? new NullDialogService(),
-            sessionContent ?? new NullSessionContentService());
+            sessionContent ?? new NullSessionContentService(),
+            new NullThemeService());
     }
 
     private static ScanItem Item(CursorDataRoot root, string relative, DataCategory category, DateTime? time = null) =>
@@ -415,18 +427,7 @@ public sealed class MainViewModelTests
         new ScanSummary(items.Length, items.Sum(item => item.Size), new Dictionary<DataCategory, long>(),
             new Dictionary<DataCategory, long>(), [], 0, TimeSpan.Zero), DateTime.UtcNow);
 
-    private static Task RunStaAsync(Func<Task> action)
-    {
-        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var thread = new Thread(() =>
-        {
-            try { action().GetAwaiter().GetResult(); completion.SetResult(); }
-            catch (Exception ex) { completion.SetException(ex); }
-        });
-        thread.SetApartmentState(ApartmentState.STA);
-        thread.Start();
-        return completion.Task;
-    }
+    private static Task RunStaAsync(Func<Task> action) => action();
 
     private static async Task WaitUntilAsync(Func<bool> condition)
     {
@@ -630,5 +631,10 @@ public sealed class MainViewModelTests
     {
         public Task<bool> ConfirmAsync(string title, string message, CancellationToken cancellationToken = default) => Task.FromResult(false);
         public Task ShowErrorAsync(string title, string message, CancellationToken cancellationToken = default) => Task.CompletedTask;
+    }
+
+    private sealed class NullThemeService : IThemeService
+    {
+        public void Apply(CleanerTheme theme) { }
     }
 }

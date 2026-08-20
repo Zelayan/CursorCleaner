@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>Cursor Cleaner</string>
+    <key>CFBundleDisplayName</key>
+    <string>Cursor Cleaner</string>
+    <key>CFBundleIdentifier</key>
+    <string>dev.cursorcleaner.app</string>
+    <key>CFBundleVersion</key>
+    <string>1.0.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+    <key>CFBundleExecutable</key>
+    <string>CursorCleaner</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Cursor Cleaner 需要通过 Finder 将已确认删除的 Cursor 数据移入废纸篓。若系统拒绝该权限，删除会失败且不会改为永久删除。</string>
+</dict>
+</plist>

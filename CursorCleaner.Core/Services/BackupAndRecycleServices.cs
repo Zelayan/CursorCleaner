@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text.Json;
@@ -34,7 +35,7 @@ public sealed class BackupService : IBackupService
         try
         {
             Directory.CreateDirectory(_backupBasePath);
-            if (GetAvailableSpace(_backupBasePath) < originalSize)
+            if (TryGetAvailableSpace(_backupBasePath, out var available) && available < originalSize)
             {
                 return new BackupOperationResult(false, null, originalSize, [], "Insufficient free space for the backup.");
             }
@@ -179,10 +180,24 @@ public sealed class BackupService : IBackupService
         return $"{root.Kind}_{safeLeaf}_{hash}";
     }
 
-    private static long GetAvailableSpace(string path)
+    private static bool TryGetAvailableSpace(string path, out long available)
     {
-        var root = Path.GetPathRoot(Path.GetFullPath(path)) ?? throw new IOException("The backup volume could not be determined.");
-        return new DriveInfo(root).AvailableFreeSpace;
+        available = 0;
+        try
+        {
+            var drive = new DriveInfo(Path.GetFullPath(path));
+            if (!drive.IsReady)
+            {
+                return false;
+            }
+
+            available = drive.AvailableFreeSpace;
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            return false;
+        }
     }
 
     private static async Task CopyFileAsync(string source, string destination, CancellationToken cancellationToken)
@@ -224,9 +239,12 @@ public sealed class WindowsRecycleBinService : IRecycleBinService
             return Task.FromCanceled<RecycleResult>(cancellationToken);
         }
 
+#pragma warning disable CA1416
         return Task.Run(() => RecycleCore(path), CancellationToken.None);
+#pragma warning restore CA1416
     }
 
+    [System.Runtime.Versioning.SupportedOSPlatform("windows")]
     private static RecycleResult RecycleCore(string path)
     {
         IFileOperation? operation = null;
@@ -304,4 +322,100 @@ public sealed class WindowsRecycleBinService : IRecycleBinService
         [PreserveSig] int PerformOperations();
         [PreserveSig] int GetAnyOperationsAborted([MarshalAs(UnmanagedType.Bool)] out bool aborted);
     }
+}
+
+public static class RecycleBinService
+{
+    public static IRecycleBinService CreateDefault()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return new WindowsRecycleBinService();
+        }
+
+        if (OperatingSystem.IsMacOS())
+        {
+            return new MacTrashService();
+        }
+
+        return new UnsupportedRecycleBinService();
+    }
+}
+
+public sealed class MacTrashService : IRecycleBinService
+{
+    public Task<RecycleResult> RecycleAsync(string path, CancellationToken cancellationToken = default)
+    {
+        if (!OperatingSystem.IsMacOS())
+        {
+            return Task.FromResult(new RecycleResult(path, false, "The macOS Trash is unavailable on this platform."));
+        }
+
+        if (cancellationToken.IsCancellationRequested)
+        {
+            return Task.FromCanceled<RecycleResult>(cancellationToken);
+        }
+
+        return Task.Run(() => RecycleCore(path), CancellationToken.None);
+    }
+
+    private static RecycleResult RecycleCore(string path)
+    {
+        try
+        {
+            var normalized = Path.GetFullPath(path);
+            if (!File.Exists(normalized) && !Directory.Exists(normalized))
+            {
+                return new RecycleResult(normalized, false, "The target no longer exists.");
+            }
+
+            var escaped = EscapeAppleScript(normalized);
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = "osascript",
+                UseShellExecute = false,
+                RedirectStandardError = true,
+                RedirectStandardOutput = true,
+                CreateNoWindow = true
+            };
+            startInfo.ArgumentList.Add("-e");
+            startInfo.ArgumentList.Add($"tell application \"Finder\" to delete POSIX file \"{escaped}\"");
+            using var process = Process.Start(startInfo);
+            if (process is null)
+            {
+                return new RecycleResult(normalized, false, "osascript could not be started.");
+            }
+
+            if (!process.WaitForExit(30_000))
+            {
+                try { process.Kill(entireProcessTree: true); } catch { }
+                return new RecycleResult(normalized, false, "The Trash operation timed out.");
+            }
+
+            if (process.ExitCode != 0)
+            {
+                var error = process.StandardError.ReadToEnd().Trim();
+                return new RecycleResult(normalized, false, string.IsNullOrWhiteSpace(error)
+                    ? $"Trash operation failed with exit code {process.ExitCode}."
+                    : error);
+            }
+
+            return File.Exists(normalized) || Directory.Exists(normalized)
+                ? new RecycleResult(normalized, false, "Finder reported success but the file still exists.")
+                : new RecycleResult(normalized, true, null);
+        }
+        catch (Exception ex)
+        {
+            return new RecycleResult(path, false, $"Trash operation failed: {ex.Message}");
+        }
+    }
+
+    private static string EscapeAppleScript(string path) =>
+        path.Replace("\\", "\\\\").Replace("\"", "\\\"");
+}
+
+public sealed class UnsupportedRecycleBinService : IRecycleBinService
+{
+    public Task<RecycleResult> RecycleAsync(string path, CancellationToken cancellationToken = default) =>
+        Task.FromResult(new RecycleResult(path, false, "A recycle bin is unavailable on this platform."));
 }

@@ -16,10 +16,18 @@ public sealed class CursorPathService : ICursorPathService
     private readonly string _userProfile;
     private readonly bool _probeCompatibilityRoots;
 
+    public static string DefaultRoamingParent => OperatingSystem.IsMacOS()
+        ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Library", "Application Support")
+        : Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+
+    public static string DefaultLocalParent => OperatingSystem.IsMacOS()
+        ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Library", "Caches")
+        : Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+
     public CursorPathService()
         : this(
-            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            DefaultRoamingParent,
+            DefaultLocalParent,
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
             true)
     {
@@ -39,17 +47,23 @@ public sealed class CursorPathService : ICursorPathService
 
     public IReadOnlyList<CursorDataRoot> GetDataRoots()
     {
+        var roamingLabel = OperatingSystem.IsMacOS() ? "Cursor Application Support data" : "Cursor roaming data";
+        var localLabel = OperatingSystem.IsMacOS() ? "Cursor Caches data" : "Cursor local data";
         var candidates = new List<CursorDataRoot>
         {
-            Create(_roamingData, "Cursor", RootKind.RoamingData, "Cursor roaming data"),
-            Create(_localData, "Cursor", RootKind.LocalData, "Cursor local data"),
+            Create(_roamingData, "Cursor", RootKind.RoamingData, roamingLabel),
+            Create(_localData, "Cursor", RootKind.LocalData, localLabel),
             Create(_userProfile, ".cursor", RootKind.UserProfile, "Cursor user data")
         };
 
         if (_probeCompatibilityRoots)
         {
-            AddIfExisting(candidates, _roamingData, "Cursor - Insiders", "Cursor Insiders roaming data");
-            AddIfExisting(candidates, _localData, "Cursor - Insiders", "Cursor Insiders local data");
+            AddIfExisting(candidates, _roamingData, "Cursor - Insiders", OperatingSystem.IsMacOS()
+                ? "Cursor Insiders Application Support data"
+                : "Cursor Insiders roaming data");
+            AddIfExisting(candidates, _localData, "Cursor - Insiders", OperatingSystem.IsMacOS()
+                ? "Cursor Insiders Caches data"
+                : "Cursor Insiders local data");
             AddIfExisting(candidates, _userProfile, ".cursor-insiders", "Cursor Insiders user data");
         }
 

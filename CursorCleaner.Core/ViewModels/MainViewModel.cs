@@ -1,8 +1,6 @@
 using System.Collections;
 using System.Collections.ObjectModel;
-using System.ComponentModel;
 using System.IO;
-using System.Windows.Data;
 using System.Windows.Input;
 using CursorCleaner.Helpers;
 using CursorCleaner.Models;
@@ -41,6 +39,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private readonly ISqliteService _sqlite;
     private readonly IDialogService _dialogs;
     private readonly ISessionContentService _sessionContent;
+    private readonly IThemeService _theme;
     private readonly object _activityGate = new();
     private readonly HashSet<Task> _activities = [];
     private readonly CancellationTokenSource _lifetimeCancellation = new();
@@ -118,7 +117,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         IScanResultStore store, IProcessService process, ILogService log,
         ISettingsService settingsService, ICleanupPlannerService planner,
         ICleanupService cleanup, IShellService shell, ISqliteService sqlite,
-        IDialogService dialogs, ISessionContentService sessionContent)
+        IDialogService dialogs, ISessionContentService sessionContent, IThemeService theme)
     {
         _pathService = pathService;
         _scanner = scanner;
@@ -134,13 +133,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _sqlite = sqlite;
         _dialogs = dialogs;
         _sessionContent = sessionContent;
-
-        ScanItemsView = CollectionViewSource.GetDefaultView(ScanItems);
-        ScanItemsView.Filter = FilterScanItem;
-        SessionsView = CollectionViewSource.GetDefaultView(Sessions);
-        SessionsView.Filter = FilterSession;
-        WorkspacesView = CollectionViewSource.GetDefaultView(Workspaces);
-        WorkspacesView.Filter = FilterWorkspace;
+        _theme = theme;
 
         NavigateCommand = new RelayCommand(p => SelectedPage = int.TryParse(p?.ToString(), out var page) ? page : 0);
         ScanCommand = new AsyncRelayCommand(token => TrackActivityAsync(() => ScanAsync(token)), () => !IsScanning && !IsBusy && !_closeRequested);
@@ -173,9 +166,14 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public IReadOnlyList<string> Categories { get; } = ["全部类型", "历史会话", "Workspace", "SQLite", "Agent Transcripts", "其他"];
     public IReadOnlyList<int> RetentionOptions { get; } = [7, 30, 90];
     public Array ThemeOptions => Enum.GetValues<CleanerTheme>();
-    public ICollectionView ScanItemsView { get; }
-    public ICollectionView SessionsView { get; }
-    public ICollectionView WorkspacesView { get; }
+    public ObservableCollection<ScanItem> FilteredScanItems { get; } = new BulkObservableCollection<ScanItem>();
+    public ObservableCollection<SessionInfo> FilteredSessions { get; } = new BulkObservableCollection<SessionInfo>();
+    public ObservableCollection<WorkspaceInfo> FilteredWorkspaces { get; } = new BulkObservableCollection<WorkspaceInfo>();
+    public string RecycleBinSettingLabel => DisplayText.RecycleBinSettingLabel;
+    public string RecycleBinModeLabel => DisplayText.RecycleBinModeLabel;
+    public string ScanRoamingLabel => DisplayText.ScanRoamingLabel;
+    public string ScanLocalLabel => DisplayText.ScanLocalLabel;
+    public string ScanUserProfileLabel => DisplayText.ScanUserProfileLabel;
 
     public ICommand NavigateCommand { get; }
     public AsyncRelayCommand ScanCommand { get; }
@@ -214,11 +212,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public string ClosingStatus { get => _closingStatus; private set { if (SetProperty(ref _closingStatus, value)) OnPropertyChanged(nameof(IsClosing)); } }
     public bool IsClosing => !string.IsNullOrWhiteSpace(ClosingStatus);
 
-    public string SearchText { get => _searchText; set { if (SetProperty(ref _searchText, value)) DebounceRefresh(ScanItemsView, ref _scanFilterCancellation, UpdateScanVisibleCount); } }
-    public string SelectedCategory { get => _selectedCategory; set { if (SetProperty(ref _selectedCategory, value)) RefreshView(ScanItemsView, UpdateScanVisibleCount); } }
-    public string SessionSearch { get => _sessionSearch; set { if (SetProperty(ref _sessionSearch, value)) DebounceRefresh(SessionsView, ref _sessionFilterCancellation, UpdateSessionVisibleCount); } }
-    public string? SessionProject { get => _sessionProject; set { if (SetProperty(ref _sessionProject, value)) RefreshView(SessionsView, UpdateSessionVisibleCount); } }
-    public string WorkspaceSearch { get => _workspaceSearch; set { if (SetProperty(ref _workspaceSearch, value)) DebounceRefresh(WorkspacesView, ref _workspaceFilterCancellation, UpdateWorkspaceVisibleCount); } }
+    public string SearchText { get => _searchText; set { if (SetProperty(ref _searchText, value)) DebounceRefresh(RefreshScanFilter); } }
+    public string SelectedCategory { get => _selectedCategory; set { if (SetProperty(ref _selectedCategory, value)) RefreshScanFilter(); } }
+    public string SessionSearch { get => _sessionSearch; set { if (SetProperty(ref _sessionSearch, value)) DebounceRefresh(RefreshSessionFilter, isSession: true); } }
+    public string? SessionProject { get => _sessionProject; set { if (SetProperty(ref _sessionProject, value)) RefreshSessionFilter(); } }
+    public string WorkspaceSearch { get => _workspaceSearch; set { if (SetProperty(ref _workspaceSearch, value)) DebounceRefresh(RefreshWorkspaceFilter, isWorkspace: true); } }
 
     public bool HasScanResult => _scanResult is not null;
     public int ScanVisibleCount { get => _scanVisibleCount; private set { if (SetProperty(ref _scanVisibleCount, value)) OnPropertyChanged(nameof(IsScanFilterEmpty)); } }
@@ -254,8 +252,16 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
     public CleanupPolicyMode CleanupPolicyMode { get => _cleanupPolicyMode; set { if (SetProperty(ref _cleanupPolicyMode, value)) { OnPropertyChanged(nameof(IsRetentionPolicy)); OnPropertyChanged(nameof(IsCutoffPolicy)); InvalidatePreview("清理策略已更改，请重新生成预览"); } } }
-    public bool IsRetentionPolicy => CleanupPolicyMode == CleanupPolicyMode.RetentionPeriod;
-    public bool IsCutoffPolicy => CleanupPolicyMode == CleanupPolicyMode.CutoffDate;
+    public bool IsRetentionPolicy
+    {
+        get => CleanupPolicyMode == CleanupPolicyMode.RetentionPeriod;
+        set { if (value) CleanupPolicyMode = CleanupPolicyMode.RetentionPeriod; }
+    }
+    public bool IsCutoffPolicy
+    {
+        get => CleanupPolicyMode == CleanupPolicyMode.CutoffDate;
+        set { if (value) CleanupPolicyMode = CleanupPolicyMode.CutoffDate; }
+    }
     public DateTime? CustomCutoff { get => _customCutoff; set { if (SetProperty(ref _customCutoff, value)) InvalidatePreview("自定义日期已更改，请重新生成预览"); } }
     public string PreviewStatus { get => _previewStatus; private set => SetProperty(ref _previewStatus, value); }
     public string OperationStatus { get => _operationStatus; private set => SetProperty(ref _operationStatus, value); }
@@ -308,7 +314,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
     public bool AdvancedToolsDisabled => !AdvancedToolsEnabled;
-    public CleanerTheme Theme { get => _settings.Theme; set { if (_settings.Theme != value) { _settings.Theme = value; SettingsChanged(nameof(Theme)); App.ApplyTheme(value); } } }
+    public CleanerTheme Theme { get => _settings.Theme; set { if (_settings.Theme != value) { _settings.Theme = value; SettingsChanged(nameof(Theme)); _theme.Apply(value); } } }
     public string SettingsStatus { get; private set; } = "设置尚未保存";
     public StatusSeverity SettingsStatusSeverity { get => _settingsStatusSeverity; private set => SetProperty(ref _settingsStatusSeverity, value); }
     public bool IsSettingsDirty { get => _isSettingsDirty; private set { if (SetProperty(ref _isSettingsDirty, value)) SaveSettingsCommand.NotifyCanExecuteChanged(); } }
@@ -326,7 +332,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             _settings = await _settingsService.LoadAsync(_lifetimeCancellation.Token);
             _retentionDays = _settings.RetentionDays is 7 or 30 or 90 ? _settings.RetentionDays : 30;
             _settings.RetentionDays = _retentionDays;
-            App.ApplyTheme(_settings.Theme);
+            _theme.Apply(_settings.Theme);
             NotifyAllSettings();
             IsSettingsDirty = false;
             SettingsStatus = $"已加载设置（无效文件会使用默认值并记录日志）：{_settingsService.SettingsPath}";
@@ -433,9 +439,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private void CommitSnapshot(ScanResult fullResult, ViewSnapshot snapshot, bool updateStore)
     {
         var previousProject = SessionProject;
-        using (ScanItemsView.DeferRefresh()) Replace(ScanItems, snapshot.Items);
-        using (WorkspacesView.DeferRefresh()) Replace(Workspaces, snapshot.Workspaces);
-        using (SessionsView.DeferRefresh()) Replace(Sessions, snapshot.Sessions);
+        Replace(ScanItems, snapshot.Items);
+        Replace(Workspaces, snapshot.Workspaces);
+        Replace(Sessions, snapshot.Sessions);
         Replace(LargeFiles, snapshot.LargeFiles);
         Replace(Databases, snapshot.Databases);
         Replace(SessionProjects, new[] { AllProjects }.Concat(snapshot.Projects));
@@ -452,9 +458,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         OtherBytes = snapshot.OtherBytes;
         CurrentUsage = TotalBytes;
         foreach (var name in new[] { nameof(TotalFiles), nameof(TotalBytes), nameof(SessionBytes), nameof(WorkspaceBytes), nameof(SqliteBytes), nameof(AgentBytes), nameof(OtherBytes) }) OnPropertyChanged(name);
-        RefreshView(ScanItemsView, UpdateScanVisibleCount);
-        RefreshView(SessionsView, UpdateSessionVisibleCount);
-        RefreshView(WorkspacesView, UpdateWorkspaceVisibleCount);
+        RefreshScanFilter();
+        RefreshSessionFilter();
+        RefreshWorkspaceFilter();
         if (updateStore)
         {
             _store.Set(fullResult);
@@ -489,9 +495,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             PreviewWorkspaces = plan.Items.Count(i => i.Category == DataCategory.Workspace);
             PreviewSessions = plan.Items.Count(i => i.Category is DataCategory.ChatSession or DataCategory.AgentTranscript);
             PreviewStatus = plan.FileCount == 0 ? "预览为空：没有符合保留策略和范围的文件" : $"预览已生成，截止 {cutoff.ToLocalTime():yyyy-MM-dd HH:mm}";
-            SelectedPage = 3;
             OnPropertyChanged(nameof(HasCleanupPlan));
             CleanupCommand.NotifyCanExecuteChanged();
+            if (plan.FileCount > 0)
+            {
+                SelectedPage = 3;
+            }
         }
         catch (Exception ex) { InvalidatePreview($"无法生成预览：{ex.Message}"); }
     }
@@ -544,7 +553,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
-        var mode = UseRecycleBin ? "回收站" : "永久删除";
+        var mode = UseRecycleBin ? DisplayText.RecycleBinModeLabel : "永久删除";
         var backup = AutomaticBackup ? "会话文件先自动备份" : "会话文件不创建备份";
         var sqliteLine = conversationIds.Length == 0
             ? "所选会话没有可匹配的 SQLite ID，不会修改数据库。"
@@ -654,7 +663,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             InvalidatePreview("Cursor 运行中，预览已失效");
             return;
         }
-        var mode = UseRecycleBin ? "回收站" : "永久删除";
+        var mode = UseRecycleBin ? DisplayText.RecycleBinModeLabel : "永久删除";
         var backup = AutomaticBackup ? "先自动备份" : "不创建备份";
         var confirmed = await _dialogs.ConfirmAsync(confirmTitle, $"将处理 {plan.FileCount:N0} 个文件，预计释放 {ByteSizeFormatter.Format(plan.TotalSize)}。\n模式：{backup}，{mode}。\n此清理计划只能执行一次，是否继续？", token);
         if (!confirmed) return;
@@ -887,18 +896,36 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         return true;
     }
 
-    private bool FilterScanItem(object value)
+    private bool MatchesScanItem(ScanItem item)
     {
-        if (value is not ScanItem item) return false;
-        var category = SelectedCategory switch { "历史会话" => item.Category == DataCategory.ChatSession, "Workspace" => item.Category == DataCategory.Workspace, "SQLite" => item.Category == DataCategory.SQLite, "Agent Transcripts" => item.Category == DataCategory.AgentTranscript, "其他" => item.Category == DataCategory.Other, _ => true };
+        var category = SelectedCategory switch
+        {
+            "历史会话" => item.Category == DataCategory.ChatSession,
+            "Workspace" => item.Category == DataCategory.Workspace,
+            "SQLite" => item.Category == DataCategory.SQLite,
+            "Agent Transcripts" => item.Category == DataCategory.AgentTranscript,
+            "其他" => item.Category == DataCategory.Other,
+            _ => true
+        };
         return category && (string.IsNullOrWhiteSpace(SearchText) || item.FullPath.Contains(SearchText, StringComparison.CurrentCultureIgnoreCase));
     }
-    private bool FilterSession(object value) => value is SessionInfo s && (string.IsNullOrWhiteSpace(SessionProject) || SessionProject == AllProjects || string.Equals(s.ProjectName, SessionProject, StringComparison.CurrentCultureIgnoreCase)) && (string.IsNullOrWhiteSpace(SessionSearch) || s.Title.Contains(SessionSearch, StringComparison.CurrentCultureIgnoreCase) || (s.ProjectName?.Contains(SessionSearch, StringComparison.CurrentCultureIgnoreCase) ?? false) || s.DisplayPath.Contains(SessionSearch, StringComparison.CurrentCultureIgnoreCase));
-    private bool FilterWorkspace(object value) => value is WorkspaceInfo w && (string.IsNullOrWhiteSpace(WorkspaceSearch) || w.DisplayName.Contains(WorkspaceSearch, StringComparison.CurrentCultureIgnoreCase) || w.WorkspacePath.Contains(WorkspaceSearch, StringComparison.CurrentCultureIgnoreCase) || (w.ProjectPath?.Contains(WorkspaceSearch, StringComparison.CurrentCultureIgnoreCase) ?? false));
+
+    private bool MatchesSession(SessionInfo session) =>
+        (string.IsNullOrWhiteSpace(SessionProject) || SessionProject == AllProjects || string.Equals(session.ProjectName, SessionProject, StringComparison.CurrentCultureIgnoreCase))
+        && (string.IsNullOrWhiteSpace(SessionSearch)
+            || session.Title.Contains(SessionSearch, StringComparison.CurrentCultureIgnoreCase)
+            || (session.ProjectName?.Contains(SessionSearch, StringComparison.CurrentCultureIgnoreCase) ?? false)
+            || session.DisplayPath.Contains(SessionSearch, StringComparison.CurrentCultureIgnoreCase));
+
+    private bool MatchesWorkspace(WorkspaceInfo workspace) =>
+        string.IsNullOrWhiteSpace(WorkspaceSearch)
+        || workspace.DisplayName.Contains(WorkspaceSearch, StringComparison.CurrentCultureIgnoreCase)
+        || workspace.WorkspacePath.Contains(WorkspaceSearch, StringComparison.CurrentCultureIgnoreCase)
+        || (workspace.ProjectPath?.Contains(WorkspaceSearch, StringComparison.CurrentCultureIgnoreCase) ?? false);
 
     private static bool HasSelectedSessions(object? parameter) => parameter is IList selected && selected.OfType<SessionInfo>().Any();
     private static bool HasSelectedWorkspaces(object? parameter) => parameter is IList selected && selected.OfType<WorkspaceInfo>().Any();
-    private static HashSet<string> GetSelectedSessionPaths(IList? selected) => selected?.OfType<SessionInfo>().Select(s => s.FilePath).Where(path => !string.IsNullOrWhiteSpace(path)).ToHashSet(StringComparer.OrdinalIgnoreCase) ?? [];
+    private static HashSet<string> GetSelectedSessionPaths(IList? selected) => selected?.OfType<SessionInfo>().Select(s => s.FilePath).Where(path => !string.IsNullOrWhiteSpace(path)).ToHashSet(PathSafety.PathComparer) ?? [];
     private string[] GetChatDatabasePaths() =>
         _scanResult?.Items
             .Where(item => item.Category == DataCategory.SQLite && CursorChatSchema.IsChatDatabaseName(item.FullPath))
@@ -908,7 +935,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private HashSet<string> GetSelectedWorkspacePaths(IList? selected)
     {
         var prefixes = selected?.OfType<WorkspaceInfo>().Select(w => w.WorkspacePath).ToArray() ?? [];
-        return _scanResult?.Items.Where(i => prefixes.Any(p => PathSafety.IsWithin(i.FullPath, p, false))).Select(i => i.FullPath).ToHashSet(StringComparer.OrdinalIgnoreCase) ?? [];
+        return _scanResult?.Items.Where(i => prefixes.Any(p => PathSafety.IsWithin(i.FullPath, p, false))).Select(i => i.FullPath).ToHashSet(PathSafety.PathComparer) ?? [];
     }
     private bool IsRootEnabled(ScanItem item) => IsRootEnabled(item.Root);
     private bool IsRootEnabled(CursorDataRoot root)
@@ -916,8 +943,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         if (root.Kind == RootKind.RoamingData) return ScanRoamingData;
         if (root.Kind == RootKind.LocalData) return ScanLocalData;
         if (root.Kind == RootKind.UserProfile) return ScanUserProfile;
-        var roaming = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
-        var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        var roaming = CursorPathService.DefaultRoamingParent;
+        var local = CursorPathService.DefaultLocalParent;
         return PathSafety.IsWithin(root.Path, roaming) ? ScanRoamingData : PathSafety.IsWithin(root.Path, local) ? ScanLocalData : ScanUserProfile;
     }
     private string[] GetApprovedRoots() => _pathService.GetDataRoots().Where(IsRootEnabled).Select(r => r.Path).ToArray();
@@ -1128,32 +1155,42 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         SaveSettingsCommand.NotifyCanExecuteChanged();
     }
     private void CancelScan() { _scanCancellation?.Cancel(); ScanCommand.Cancel(); }
-    private void DebounceRefresh(ICollectionView view, ref CancellationTokenSource? cancellation, Action updateCount)
+    private void DebounceRefresh(Action refresh, bool isSession = false, bool isWorkspace = false)
     {
+        ref var cancellation = ref _scanFilterCancellation;
+        if (isSession) cancellation = ref _sessionFilterCancellation;
+        else if (isWorkspace) cancellation = ref _workspaceFilterCancellation;
         cancellation?.Cancel();
         cancellation?.Dispose();
         cancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetimeCancellation.Token);
         var token = cancellation.Token;
-        _ = DebounceRefreshAsync(view, updateCount, token);
+        _ = DebounceRefreshAsync(refresh, token);
     }
-    private static async Task DebounceRefreshAsync(ICollectionView view, Action updateCount, CancellationToken token)
+    private static async Task DebounceRefreshAsync(Action refresh, CancellationToken token)
     {
         try
         {
             await Task.Delay(250, token);
             token.ThrowIfCancellationRequested();
-            RefreshView(view, updateCount);
+            refresh();
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested) { }
     }
-    private static void RefreshView(ICollectionView view, Action updateCount)
+    private void RefreshScanFilter()
     {
-        view.Refresh();
-        updateCount();
+        Replace(FilteredScanItems, ScanItems.Where(MatchesScanItem));
+        ScanVisibleCount = FilteredScanItems.Count;
     }
-    private void UpdateScanVisibleCount() => ScanVisibleCount = ScanItemsView.Cast<object>().Count();
-    private void UpdateSessionVisibleCount() => SessionVisibleCount = SessionsView.Cast<object>().Count();
-    private void UpdateWorkspaceVisibleCount() => WorkspaceVisibleCount = WorkspacesView.Cast<object>().Count();
+    private void RefreshSessionFilter()
+    {
+        Replace(FilteredSessions, Sessions.Where(MatchesSession));
+        SessionVisibleCount = FilteredSessions.Count;
+    }
+    private void RefreshWorkspaceFilter()
+    {
+        Replace(FilteredWorkspaces, Workspaces.Where(MatchesWorkspace));
+        WorkspaceVisibleCount = FilteredWorkspaces.Count;
+    }
     private void OpenDirectory(object? parameter)
     {
         if (parameter is ScanItem item) TryShell(() => _shell.SelectFile(item.FullPath));

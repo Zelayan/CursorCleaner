@@ -1,0 +1,123 @@
+<Application xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:conv="using:CursorCleaner.Converters"
+             x:Class="CursorCleaner.App"
+             RequestedThemeVariant="Default">
+  <Application.Resources>
+    <SolidColorBrush x:Key="WindowBrush" Color="#FFF4F4F4"/>
+    <SolidColorBrush x:Key="SurfaceBrush" Color="#FFFFFFFF"/>
+    <SolidColorBrush x:Key="SurfaceAltBrush" Color="#FFECECEC"/>
+    <SolidColorBrush x:Key="SurfaceHoverBrush" Color="#FFE5E5E5"/>
+    <SolidColorBrush x:Key="SurfacePressedBrush" Color="#FFDADADA"/>
+    <SolidColorBrush x:Key="BorderBrush" Color="#FFB8B8B8"/>
+    <SolidColorBrush x:Key="StrongBorderBrush" Color="#FF7A7A7A"/>
+    <SolidColorBrush x:Key="TextBrush" Color="#FF1A1A1A"/>
+    <SolidColorBrush x:Key="MutedTextBrush" Color="#FF565656"/>
+    <SolidColorBrush x:Key="DisabledTextBrush" Color="#FF8A8A8A"/>
+    <SolidColorBrush x:Key="AccentBrush" Color="#FF0067C0"/>
+    <SolidColorBrush x:Key="AccentHoverBrush" Color="#FF005A9E"/>
+    <SolidColorBrush x:Key="AccentPressedBrush" Color="#FF004578"/>
+    <SolidColorBrush x:Key="AccentSoftBrush" Color="#FFDCEEFF"/>
+    <SolidColorBrush x:Key="AccentTextBrush" Color="#FFFFFFFF"/>
+    <SolidColorBrush x:Key="WarningBrush" Color="#FF8A4B00"/>
+    <SolidColorBrush x:Key="WarningBackgroundBrush" Color="#FFFFF4CE"/>
+    <SolidColorBrush x:Key="ErrorBrush" Color="#FFB10E1C"/>
+    <SolidColorBrush x:Key="ErrorBackgroundBrush" Color="#FFFDE7E9"/>
+    <SolidColorBrush x:Key="SuccessBrush" Color="#FF0F6B0F"/>
+
+    <conv:ByteSizeConverter x:Key="ByteSizeConverter"/>
+    <conv:BooleanToVisibilityConverter x:Key="BoolVisibilityConverter"/>
+    <conv:PageVisibilityConverter x:Key="PageVisibilityConverter"/>
+    <conv:SessionSourceConverter x:Key="SessionSourceConverter"/>
+    <conv:ThemeConverter x:Key="ThemeConverter"/>
+    <conv:UtcToLocalTimeConverter x:Key="UtcToLocalTimeConverter"/>
+    <conv:StatusBrushConverter x:Key="StatusBrushConverter"/>
+    <conv:SessionRoleBrushConverter x:Key="SessionRoleBrushConverter"/>
+    <conv:DataCategoryConverter x:Key="DataCategoryConverter"/>
+    <conv:CategoryRecommendationConverter x:Key="CategoryRecommendationConverter"/>
+    <conv:WorkspaceRecommendationConverter x:Key="WorkspaceRecommendationConverter"/>
+    <conv:EnumEqualsConverter x:Key="EnumEqualsConverter"/>
+    <conv:DateTimeOffsetConverter x:Key="DateTimeOffsetConverter"/>
+  </Application.Resources>
+  <Application.Styles>
+    <FluentTheme />
+    <StyleInclude Source="avares://Avalonia.Controls.DataGrid/Themes/Fluent.xaml"/>
+    <Style Selector="Window">
+      <Setter Property="FontSize" Value="13"/>
+      <Setter Property="Background" Value="{DynamicResource WindowBrush}"/>
+      <Setter Property="Foreground" Value="{DynamicResource TextBrush}"/>
+    </Style>
+    <Style Selector="TextBlock">
+      <Setter Property="Foreground" Value="{DynamicResource TextBrush}"/>
+    </Style>
+    <Style Selector="TextBlock.muted">
+      <Setter Property="Foreground" Value="{DynamicResource MutedTextBrush}"/>
+    </Style>
+    <Style Selector="TextBlock.pageTitle">
+      <Setter Property="FontSize" Value="22"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="Margin" Value="0,0,0,14"/>
+    </Style>
+    <Style Selector="TextBlock.sectionHeader">
+      <Setter Property="FontSize" Value="15"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="Margin" Value="0,0,0,8"/>
+    </Style>
+    <Style Selector="TextBlock.statLabel">
+      <Setter Property="Foreground" Value="{DynamicResource MutedTextBrush}"/>
+      <Setter Property="FontSize" Value="12"/>
+      <Setter Property="TextWrapping" Value="Wrap"/>
+    </Style>
+    <Style Selector="TextBlock.statValue">
+      <Setter Property="FontSize" Value="20"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="Margin" Value="0,4,0,0"/>
+    </Style>
+    <Style Selector="Border.card">
+      <Setter Property="Background" Value="{DynamicResource SurfaceBrush}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="CornerRadius" Value="6"/>
+      <Setter Property="Padding" Value="14"/>
+    </Style>
+    <Style Selector="Button">
+      <Setter Property="MinHeight" Value="32"/>
+      <Setter Property="Padding" Value="12,4"/>
+      <Setter Property="Margin" Value="0,0,8,0"/>
+    </Style>
+    <Style Selector="Button.primary">
+      <Setter Property="Background" Value="{DynamicResource AccentBrush}"/>
+      <Setter Property="Foreground" Value="{DynamicResource AccentTextBrush}"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+    </Style>
+    <Style Selector="TextBox">
+      <Setter Property="MinHeight" Value="32"/>
+      <Setter Property="Padding" Value="8,4"/>
+    </Style>
+    <Style Selector="ComboBox">
+      <Setter Property="MinHeight" Value="32"/>
+    </Style>
+    <Style Selector="DataGrid">
+      <Setter Property="Background" Value="{DynamicResource SurfaceBrush}"/>
+      <Setter Property="Foreground" Value="{DynamicResource TextBrush}"/>
+      <Setter Property="GridLinesVisibility" Value="Horizontal"/>
+      <Setter Property="HeadersVisibility" Value="Column"/>
+      <Setter Property="IsReadOnly" Value="True"/>
+      <Setter Property="RowHeight" Value="34"/>
+    </Style>
+    <Style Selector="CheckBox">
+      <Setter Property="Margin" Value="0,5"/>
+      <Setter Property="Foreground" Value="{DynamicResource TextBrush}"/>
+    </Style>
+    <Style Selector="Button.nav">
+      <Setter Property="HorizontalAlignment" Value="Stretch"/>
+      <Setter Property="HorizontalContentAlignment" Value="Left"/>
+      <Setter Property="Margin" Value="0,0,0,4"/>
+      <Setter Property="Background" Value="Transparent"/>
+    </Style>
+    <Style Selector="Button.nav.selected">
+      <Setter Property="Background" Value="{DynamicResource AccentSoftBrush}"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+    </Style>
+  </Application.Styles>
+</Application>

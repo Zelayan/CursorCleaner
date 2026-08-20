@@ -165,6 +165,7 @@ public sealed class OperationServiceTests
         Assert.IsFalse(File.Exists(first.FullPath));
         Assert.IsTrue(File.Exists(second.FullPath));
         Assert.IsFalse(result.Items.Single(item => item.Path == second.FullPath).Succeeded);
+        Assert.IsTrue(File.Exists(second.FullPath), "A recycle/trash failure must not fall back to permanent delete.");
     }
 
     [TestMethod]
@@ -297,7 +298,7 @@ public sealed class OperationServiceTests
         using var temp = new TemporaryDirectory();
         var root = CreateRoot(temp.Path);
         var item = CreateFileItem(root, "workspaceStorage/item.json", DataCategory.Workspace, DateTime.UtcNow.AddDays(-2));
-        var planItem = ToPlanItem(item) with { Identity = new FileIdentity(uint.MaxValue, ulong.MaxValue) };
+        var planItem = ToPlanItem(item) with { Identity = new FileIdentity(ulong.MaxValue, ulong.MaxValue) };
         var recycle = new FakeRecycleBinService(deleteOnSuccess: true);
         var service = CreateCleanupService(temp.Path, false, recycle);
 

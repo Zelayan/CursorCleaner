@@ -1,0 +1,47 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>CursorCleaner</RootNamespace>
+    <AssemblyName>CursorCleaner</AssemblyName>
+    <ApplicationTitle>Cursor Cleaner</ApplicationTitle>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <BuiltInComInteropSupport>true</BuiltInComInteropSupport>
+    <AvaloniaUseCompiledBindingsByDefault>false</AvaloniaUseCompiledBindingsByDefault>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <PublishTrimmed>false</PublishTrimmed>
+    <DebugType>embedded</DebugType>
+    <RuntimeIdentifiers>win-x64;osx-arm64</RuntimeIdentifiers>
+    <PublishSingleFile Condition="'$(RuntimeIdentifier)' == 'win-x64'">true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract Condition="'$(RuntimeIdentifier)' == 'win-x64'">true</IncludeNativeLibrariesForSelfExtract>
+    <PublishReadyToRun Condition="'$(RuntimeIdentifier)' == 'win-x64'">true</PublishReadyToRun>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\CursorCleaner.Core\CursorCleaner.Core.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Avalonia" Version="11.2.7" />
+    <PackageReference Include="Avalonia.Desktop" Version="11.2.7" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="11.2.7" />
+    <PackageReference Include="Avalonia.Controls.DataGrid" Version="11.2.7" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="Mac\Info.plist" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <Target Name="CreateMacAppBundle" AfterTargets="Publish" Condition="'$(RuntimeIdentifier)' == 'osx-arm64'">
+    <PropertyGroup>
+      <MacAppBundle>$(PublishDir)CursorCleaner.app</MacAppBundle>
+      <MacAppContents>$(MacAppBundle)\Contents</MacAppContents>
+      <MacAppMacOS>$(MacAppContents)\MacOS</MacAppMacOS>
+    </PropertyGroup>
+    <ItemGroup>
+      <MacPublishFiles Include="$(PublishDir)**\*" Exclude="$(MacAppBundle)\**\*" />
+    </ItemGroup>
+    <RemoveDir Directories="$(MacAppBundle)" Condition="Exists('$(MacAppBundle)')" />
+    <MakeDir Directories="$(MacAppMacOS)" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\Mac\Info.plist" DestinationFiles="$(MacAppContents)\Info.plist" />
+    <Copy SourceFiles="@(MacPublishFiles)" DestinationFiles="@(MacPublishFiles->'$(MacAppMacOS)\%(RecursiveDir)%(Filename)%(Extension)')" />
+  </Target>
+</Project>

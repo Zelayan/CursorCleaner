@@ -287,7 +287,19 @@ public sealed class ShellService : IShellService
             throw new DirectoryNotFoundException($"Directory not found: {normalized}");
         }
 
-        StartExplorer(normalized);
+        if (OperatingSystem.IsWindows())
+        {
+            StartWindows("explorer.exe", normalized);
+            return;
+        }
+
+        if (OperatingSystem.IsMacOS())
+        {
+            StartMac("open", normalized);
+            return;
+        }
+
+        throw new PlatformNotSupportedException("Opening directories is not supported on this platform.");
     }
 
     public void SelectFile(string path)
@@ -298,22 +310,49 @@ public sealed class ShellService : IShellService
             throw new FileNotFoundException("File not found.", normalized);
         }
 
-        StartExplorer($"/select,\"{normalized}\"");
+        if (OperatingSystem.IsWindows())
+        {
+            StartWindows("explorer.exe", $"/select,\"{normalized}\"");
+            return;
+        }
+
+        if (OperatingSystem.IsMacOS())
+        {
+            StartMac("open", "-R", normalized);
+            return;
+        }
+
+        throw new PlatformNotSupportedException("Selecting files is not supported on this platform.");
     }
 
     public void OpenLogs()
     {
         Directory.CreateDirectory(_log.LogDirectory);
-        StartExplorer(_log.LogDirectory);
+        OpenDirectory(_log.LogDirectory);
     }
 
-    private static void StartExplorer(string arguments)
+    private static void StartWindows(string fileName, string arguments)
     {
         Process.Start(new ProcessStartInfo
         {
-            FileName = "explorer.exe",
+            FileName = fileName,
             Arguments = arguments,
             UseShellExecute = true
         });
+    }
+
+    private static void StartMac(string fileName, params string[] arguments)
+    {
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = fileName,
+            UseShellExecute = false
+        };
+        foreach (var argument in arguments)
+        {
+            startInfo.ArgumentList.Add(argument);
+        }
+
+        Process.Start(startInfo);
     }
 }

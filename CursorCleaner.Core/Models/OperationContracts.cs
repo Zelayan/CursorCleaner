@@ -32,7 +32,7 @@ public sealed record CleanupPlanItem(
     DateTime LastWriteTimeUtc,
     FileIdentity? Identity = null);
 
-public sealed record FileIdentity(uint VolumeSerialNumber, ulong FileId);
+public sealed record FileIdentity(ulong DeviceId, ulong FileId);
 
 public sealed record CleanupPlan
 {
@@ -149,12 +149,22 @@ public interface ICleanupPlannerService
     CleanupPlan CreateSelectedPlan(ScanResult scanResult, IEnumerable<string> approvedRoots, IEnumerable<string> selectedPaths);
 }
 
+public interface IFileIdentityService
+{
+    bool TryGetFileIdentity(string path, out FileIdentity? identity, out string? error);
+}
+
 public interface IPathGuard
 {
     IReadOnlyList<string> CursorRoots { get; }
     PathGuardResult ValidateCleanupTarget(string path, IEnumerable<string> approvedRoots);
     PathGuardResult ValidateSqliteTarget(string path, IEnumerable<string> approvedRoots);
     bool TryGetFileIdentity(string path, out FileIdentity? identity, out string? error);
+}
+
+public interface IThemeService
+{
+    void Apply(CleanerTheme theme);
 }
 
 public interface IBackupService

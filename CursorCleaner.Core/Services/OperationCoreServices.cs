@@ -1,6 +1,5 @@
 using System.Diagnostics;
 using System.IO;
-using System.Runtime.InteropServices;
 using System.Text.Json;
 using CursorCleaner.Helpers;
 using CursorCleaner.Models;
@@ -9,7 +8,16 @@ namespace CursorCleaner.Services;
 
 public sealed class ProcessService : IProcessService
 {
-    private static readonly string[] CursorProcessNames = ["Cursor", "Cursor - Insiders", "Cursor-Insiders"];
+    private static readonly string[] CursorProcessNames =
+    [
+        "Cursor",
+        "Cursor - Insiders",
+        "Cursor-Insiders",
+        "Cursor Helper",
+        "Cursor Helper (GPU)",
+        "Cursor Helper (Renderer)",
+        "Cursor Helper (Plugin)"
+    ];
 
     public bool IsCursorRunning()
     {
@@ -44,10 +52,7 @@ public sealed class LogService : ILogService
 
     public LogService(string? logDirectory = null)
     {
-        LogDirectory = Path.GetFullPath(logDirectory ?? Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "CursorCleaner",
-            "logs"));
+        LogDirectory = Path.GetFullPath(logDirectory ?? AppStorage.DefaultLogs);
     }
 
     public string LogDirectory { get; }
@@ -95,9 +100,7 @@ public sealed class SettingsService : ISettingsService
     public SettingsService(ILogService log, string? settingsDirectory = null)
     {
         _log = log;
-        var directory = Path.GetFullPath(settingsDirectory ?? Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "CursorCleaner"));
+        var directory = Path.GetFullPath(settingsDirectory ?? AppStorage.DefaultRoot);
         SettingsPath = Path.Combine(directory, "settings.json");
     }
 
@@ -142,13 +145,13 @@ public sealed class SettingsService : ISettingsService
                 await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
             }
 
-            if (File.Exists(SettingsPath))
+            if (OperatingSystem.IsWindows() && File.Exists(SettingsPath))
             {
                 File.Replace(temporaryPath, SettingsPath, null);
             }
             else
             {
-                File.Move(temporaryPath, SettingsPath);
+                File.Move(temporaryPath, SettingsPath, overwrite: true);
             }
         }
         catch (Exception ex)
@@ -292,10 +295,12 @@ public sealed class CleanupPlannerService : ICleanupPlannerService
 public sealed class PathGuard : IPathGuard
 {
     private static readonly string[] SqliteExtensions = [".vscdb", ".db", ".sqlite"];
+    private readonly IFileIdentityService _identity;
 
-    public PathGuard(IEnumerable<string>? cursorRoots = null)
+    public PathGuard(IEnumerable<string>? cursorRoots = null, IFileIdentityService? identity = null)
     {
         CursorRoots = (cursorRoots ?? []).Select(PathSafety.Normalize).Distinct(PathSafety.PathComparer).ToArray();
+        _identity = identity ?? FileIdentityService.CreateDefault();
     }
 
     public IReadOnlyList<string> CursorRoots { get; }
@@ -306,40 +311,8 @@ public sealed class PathGuard : IPathGuard
     public PathGuardResult ValidateSqliteTarget(string path, IEnumerable<string> approvedRoots) =>
         Validate(path, approvedRoots, requireSqlite: true);
 
-    public bool TryGetFileIdentity(string path, out FileIdentity? identity, out string? error)
-    {
-        identity = null;
-        error = null;
-        if (!OperatingSystem.IsWindows())
-        {
-            error = "File identity verification requires Windows.";
-            return false;
-        }
-
-        try
-        {
-            using var handle = File.OpenHandle(
-                PathSafety.Normalize(path),
-                FileMode.Open,
-                FileAccess.Read,
-                FileShare.ReadWrite | FileShare.Delete,
-                FileOptions.None);
-            if (!GetFileInformationByHandle(handle, out var information))
-            {
-                error = $"File identity could not be read (Win32 error {Marshal.GetLastWin32Error()}).";
-                return false;
-            }
-
-            var fileId = ((ulong)information.FileIndexHigh << 32) | information.FileIndexLow;
-            identity = new FileIdentity(information.VolumeSerialNumber, fileId);
-            return true;
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
-        {
-            error = $"File identity could not be read: {ex.Message}";
-            return false;
-        }
-    }
+    public bool TryGetFileIdentity(string path, out FileIdentity? identity, out string? error) =>
+        _identity.TryGetFileIdentity(path, out identity, out error);
 
     private PathGuardResult Validate(string path, IEnumerable<string> approvedRoots, bool requireSqlite)
     {
@@ -416,25 +389,4 @@ public sealed class PathGuard : IPathGuard
         || path.EndsWith("-journal", StringComparison.OrdinalIgnoreCase);
 
     private static PathGuardResult Reject(string error) => new(false, null, error);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool GetFileInformationByHandle(
-        Microsoft.Win32.SafeHandles.SafeFileHandle fileHandle,
-        out ByHandleFileInformation fileInformation);
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct ByHandleFileInformation
-    {
-        public uint FileAttributes;
-        public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
-        public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
-        public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
-        public uint VolumeSerialNumber;
-        public uint FileSizeHigh;
-        public uint FileSizeLow;
-        public uint NumberOfLinks;
-        public uint FileIndexHigh;
-        public uint FileIndexLow;
-    }
 }

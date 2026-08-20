@@ -1,3 +1,4 @@
+using CursorCleaner.Helpers;
 using CursorCleaner.Models;
 using CursorCleaner.Services;
 
@@ -134,6 +135,92 @@ public sealed class ScannerTests
 
         Assert.AreEqual(0, result.Summary.TotalFiles);
         Assert.AreEqual(1, result.Summary.ErrorCount);
+    }
+
+    [TestMethod]
+    public void CursorPathService_UsesInjectedParentsAndDeduplicates()
+    {
+        using var temp = new TemporaryDirectory();
+        var support = Path.Combine(temp.Path, "Application Support");
+        var caches = Path.Combine(temp.Path, "Caches");
+        var profile = Path.Combine(temp.Path, "home");
+        Directory.CreateDirectory(Path.Combine(support, "Cursor"));
+        Directory.CreateDirectory(Path.Combine(caches, "Cursor"));
+        Directory.CreateDirectory(Path.Combine(profile, ".cursor"));
+
+        var roots = new CursorPathService(support, caches, profile, probeCompatibilityRoots: false).GetDataRoots();
+
+        Assert.AreEqual(3, roots.Count);
+        Assert.AreEqual(RootKind.RoamingData, roots[0].Kind);
+        Assert.AreEqual(RootKind.LocalData, roots[1].Kind);
+        Assert.AreEqual(RootKind.UserProfile, roots[2].Kind);
+        StringAssert.Contains(roots[0].Path, "Cursor");
+        StringAssert.Contains(roots[2].Path, ".cursor");
+    }
+
+    [TestMethod]
+    public void FileIdentity_HasDeviceAndFileId()
+    {
+        using var temp = new TemporaryDirectory();
+        var path = Path.Combine(temp.Path, "item.json");
+        File.WriteAllText(path, "x");
+        var identity = FileIdentityService.CreateDefault();
+
+        Assert.IsTrue(identity.TryGetFileIdentity(path, out var actual, out var error), error);
+        Assert.IsNotNull(actual);
+        Assert.AreNotEqual(0UL, actual!.FileId);
+    }
+
+    [TestMethod]
+    public void AppStorage_UsesPlatformApplicationSupportOrLocalAppData()
+    {
+        if (OperatingSystem.IsMacOS())
+        {
+            StringAssert.Contains(AppStorage.DefaultRoot, Path.Combine("Library", "Application Support", "CursorCleaner"));
+            StringAssert.Contains(AppStorage.DefaultLogs, "logs");
+        }
+        else
+        {
+            StringAssert.Contains(AppStorage.DefaultRoot, "CursorCleaner");
+            Assert.AreEqual(
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CursorCleaner"),
+                AppStorage.DefaultRoot);
+        }
+    }
+
+    [TestMethod]
+    public void MacFileIdentity_IsSkippedOnNonMacHosts()
+    {
+#pragma warning disable CA1416
+        if (OperatingSystem.IsMacOS())
+        {
+            using var temp = new TemporaryDirectory();
+            var path = Path.Combine(temp.Path, "item.json");
+            File.WriteAllText(path, "x");
+            Assert.IsTrue(new MacFileIdentityService().TryGetFileIdentity(path, out var identity, out var error), error);
+            Assert.IsNotNull(identity);
+            Assert.AreNotEqual(0UL, identity!.FileId);
+            return;
+        }
+
+        Assert.IsFalse(new MacFileIdentityService().TryGetFileIdentity("any", out _, out var unavailable));
+        StringAssert.Contains(unavailable, "macOS");
+#pragma warning restore CA1416
+    }
+
+    [TestMethod]
+    public void DisplayText_RecycleBinLabelIsPlatformSpecific()
+    {
+        if (OperatingSystem.IsMacOS())
+        {
+            Assert.AreEqual("使用废纸篓", DisplayText.RecycleBinSettingLabel);
+            Assert.AreEqual("Application Support 数据", DisplayText.ScanRoamingLabel);
+        }
+        else
+        {
+            Assert.AreEqual("使用 Windows 回收站", DisplayText.RecycleBinSettingLabel);
+            Assert.AreEqual("Roaming 数据", DisplayText.ScanRoamingLabel);
+        }
     }
 
     private sealed class StaticPathService(params CursorDataRoot[] roots) : ICursorPathService

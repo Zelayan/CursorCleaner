@@ -1,0 +1,520 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="CursorCleaner.MainWindow"
+        x:Name="RootWindow"
+        Title="Cursor Cleaner"
+        Width="1220" Height="760" MinWidth="920" MinHeight="600"
+        WindowStartupLocation="CenterScreen">
+  <Grid Background="{DynamicResource WindowBrush}">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="66"/>
+      <RowDefinition Height="*"/>
+      <RowDefinition Height="32"/>
+    </Grid.RowDefinitions>
+
+    <Border Grid.Row="0" Background="{DynamicResource SurfaceBrush}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="0,0,0,1" Padding="20,8">
+      <Grid>
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition/>
+          <ColumnDefinition Width="Auto"/>
+        </Grid.ColumnDefinitions>
+        <StackPanel VerticalAlignment="Center">
+          <TextBlock Text="Cursor Cleaner" FontSize="20" FontWeight="SemiBold"/>
+          <TextBlock Text="Cursor 数据检查与清理工具" Classes="muted" Margin="0,2,0,0"/>
+        </StackPanel>
+        <StackPanel Grid.Column="1" VerticalAlignment="Center" HorizontalAlignment="Right">
+          <TextBlock Text="{Binding BusyText}" FontWeight="SemiBold" HorizontalAlignment="Right"/>
+          <TextBlock Text="{Binding ScanStatus}" Foreground="{Binding ScanStatusSeverity, Converter={StaticResource StatusBrushConverter}}" HorizontalAlignment="Right"/>
+          <TextBlock Text="{Binding CursorStateText}" Foreground="{Binding CursorStatusSeverity, Converter={StaticResource StatusBrushConverter}}" HorizontalAlignment="Right" Margin="0,2,0,0"/>
+        </StackPanel>
+      </Grid>
+    </Border>
+
+    <Grid Grid.Row="1">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="190"/>
+        <ColumnDefinition Width="*"/>
+      </Grid.ColumnDefinitions>
+      <Border Background="{DynamicResource SurfaceBrush}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="0,0,1,0">
+        <StackPanel Margin="8">
+          <Button Content="总览" Command="{Binding NavigateCommand}" CommandParameter="0" Classes="nav"
+                  Classes.selected="{Binding SelectedPage, Converter={StaticResource PageVisibilityConverter}, ConverterParameter=0}"/>
+          <Button Content="历史会话" Command="{Binding NavigateCommand}" CommandParameter="1" Classes="nav"
+                  Classes.selected="{Binding SelectedPage, Converter={StaticResource PageVisibilityConverter}, ConverterParameter=1}"/>
+          <Button Content="工作区" Command="{Binding NavigateCommand}" CommandParameter="2" Classes="nav"
+                  IsVisible="{Binding AdvancedFeaturesEnabled}"
+                  Classes.selected="{Binding SelectedPage, Converter={StaticResource PageVisibilityConverter}, ConverterParameter=2}"/>
+          <Button Content="空间分析" Command="{Binding NavigateCommand}" CommandParameter="3" Classes="nav"
+                  IsVisible="{Binding AdvancedFeaturesEnabled}"
+                  Classes.selected="{Binding SelectedPage, Converter={StaticResource PageVisibilityConverter}, ConverterParameter=3}"/>
+          <Button Content="高级工具" Command="{Binding NavigateCommand}" CommandParameter="4" Classes="nav"
+                  IsVisible="{Binding AdvancedToolsEnabled}"
+                  Classes.selected="{Binding SelectedPage, Converter={StaticResource PageVisibilityConverter}, ConverterParameter=4}"/>
+          <Button Content="设置" Command="{Binding NavigateCommand}" CommandParameter="5" Classes="nav"
+                  Classes.selected="{Binding SelectedPage, Converter={StaticResource PageVisibilityConverter}, ConverterParameter=5}"/>
+        </StackPanel>
+      </Border>
+
+      <Grid Grid.Column="1" Margin="20,16,20,12">
+        <!-- 0 总览 -->
+        <Grid IsVisible="{Binding SelectedPage, Converter={StaticResource PageVisibilityConverter}, ConverterParameter=0}">
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+          </Grid.RowDefinitions>
+          <Grid>
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition/>
+              <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Text="总览" Classes="pageTitle"/>
+            <StackPanel Grid.Column="1" Orientation="Horizontal">
+              <Button Command="{Binding ScanCommand}" Classes="primary" Content="扫描"/>
+              <Button Command="{Binding CancelScanCommand}" Content="取消扫描" IsVisible="{Binding IsScanning}"/>
+            </StackPanel>
+          </Grid>
+          <Grid Grid.Row="1" Margin="0,0,0,12">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition/><ColumnDefinition/><ColumnDefinition/>
+            </Grid.ColumnDefinitions>
+            <Grid.RowDefinitions>
+              <RowDefinition/><RowDefinition/>
+            </Grid.RowDefinitions>
+            <Border Classes="card" Margin="0,0,8,8">
+              <StackPanel>
+                <TextBlock Text="总占用" Classes="statLabel"/>
+                <TextBlock Text="{Binding TotalBytes, Converter={StaticResource ByteSizeConverter}}" Classes="statValue"/>
+                <TextBlock Text="{Binding TotalFiles, StringFormat={}{0:N0} 个文件}" Classes="muted"/>
+              </StackPanel>
+            </Border>
+            <Border Grid.Column="1" Classes="card" Margin="0,0,8,8">
+              <StackPanel>
+                <TextBlock Text="历史会话" Classes="statLabel"/>
+                <TextBlock Text="{Binding SessionBytes, Converter={StaticResource ByteSizeConverter}}" Classes="statValue"/>
+              </StackPanel>
+            </Border>
+            <Border Grid.Column="2" Classes="card" Margin="0,0,0,8">
+              <StackPanel>
+                <TextBlock Text="工作区存储" Classes="statLabel"/>
+                <TextBlock Text="{Binding WorkspaceBytes, Converter={StaticResource ByteSizeConverter}}" Classes="statValue"/>
+              </StackPanel>
+            </Border>
+            <Border Grid.Row="1" Classes="card" Margin="0,0,8,0">
+              <StackPanel>
+                <TextBlock Text="SQLite 数据库" Classes="statLabel"/>
+                <TextBlock Text="{Binding SqliteBytes, Converter={StaticResource ByteSizeConverter}}" Classes="statValue"/>
+              </StackPanel>
+            </Border>
+            <Border Grid.Row="1" Grid.Column="1" Classes="card" Margin="0,0,8,0">
+              <StackPanel>
+                <TextBlock Text="代理记录" Classes="statLabel"/>
+                <TextBlock Text="{Binding AgentBytes, Converter={StaticResource ByteSizeConverter}}" Classes="statValue"/>
+              </StackPanel>
+            </Border>
+            <Border Grid.Row="1" Grid.Column="2" Classes="card">
+              <StackPanel>
+                <TextBlock Text="其他数据" Classes="statLabel"/>
+                <TextBlock Text="{Binding OtherBytes, Converter={StaticResource ByteSizeConverter}}" Classes="statValue"/>
+              </StackPanel>
+            </Border>
+          </Grid>
+          <Border Grid.Row="2" Classes="card" Padding="10" Margin="0,0,0,12" IsVisible="{Binding IsProgressVisible}">
+            <StackPanel>
+              <ProgressBar IsIndeterminate="True"/>
+              <Grid Margin="0,7,0,0">
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition/>
+                  <ColumnDefinition Width="Auto"/>
+                  <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Text="{Binding CurrentScanPath}" TextTrimming="CharacterEllipsis"/>
+                <TextBlock Grid.Column="1" Text="{Binding ProgressFiles, StringFormat={}{0:N0} 个文件}" Margin="14,0"/>
+                <TextBlock Grid.Column="2" Text="{Binding ProgressBytes, Converter={StaticResource ByteSizeConverter}}"/>
+              </Grid>
+            </StackPanel>
+          </Border>
+          <Grid Grid.Row="3">
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="*"/>
+            </Grid.RowDefinitions>
+            <Grid Margin="0,0,0,8">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="8"/>
+                <ColumnDefinition Width="170"/>
+                <ColumnDefinition Width="Auto"/>
+              </Grid.ColumnDefinitions>
+              <TextBox Watermark="搜索文件路径" Text="{Binding SearchText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+              <ComboBox Grid.Column="2" ItemsSource="{Binding Categories}" SelectedItem="{Binding SelectedCategory, Mode=TwoWay}"/>
+              <TextBlock Grid.Column="3" Text="{Binding ScanVisibleCount, StringFormat=文件 {0:N0}}" VerticalAlignment="Center" Margin="12,0,0,0"/>
+            </Grid>
+            <Grid Grid.Row="1">
+              <DataGrid x:Name="ScanGrid" ItemsSource="{Binding FilteredScanItems}" AutoGenerateColumns="False" IsReadOnly="True">
+                <DataGrid.Columns>
+                  <DataGridTextColumn Header="路径" Binding="{Binding RelativePath}" Width="2*"/>
+                  <DataGridTextColumn Header="类型" Binding="{Binding Category, Converter={StaticResource DataCategoryConverter}}" Width="110"/>
+                  <DataGridTextColumn Header="建议" Binding="{Binding Category, Converter={StaticResource CategoryRecommendationConverter}}" Width="180"/>
+                  <DataGridTextColumn Header="本地时间" Binding="{Binding LastWriteTimeUtc, Converter={StaticResource UtcToLocalTimeConverter}}" Width="145"/>
+                  <DataGridTextColumn Header="大小" Binding="{Binding Size, Converter={StaticResource ByteSizeConverter}}" Width="100"/>
+                </DataGrid.Columns>
+                <DataGrid.ContextMenu>
+                  <ContextMenu>
+                    <MenuItem Header="打开所在位置" Click="OpenSelectedLocation_Click"/>
+                  </ContextMenu>
+                </DataGrid.ContextMenu>
+              </DataGrid>
+              <Border Background="{DynamicResource SurfaceBrush}" IsVisible="{Binding HasScanResult, Converter={StaticResource BoolVisibilityConverter}, ConverterParameter=Invert}">
+                <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
+                  <TextBlock Text="尚未扫描" FontSize="17" FontWeight="SemiBold" HorizontalAlignment="Center"/>
+                  <TextBlock Text="扫描后将在此显示 Cursor 数据文件。扫描不会修改任何文件。" Classes="muted" Margin="0,6,0,0" TextWrapping="Wrap"/>
+                </StackPanel>
+              </Border>
+              <Border Background="{DynamicResource SurfaceBrush}" IsVisible="{Binding IsScanFilterEmpty}">
+                <TextBlock Text="没有符合筛选条件的文件" HorizontalAlignment="Center" VerticalAlignment="Center" Classes="muted"/>
+              </Border>
+            </Grid>
+          </Grid>
+        </Grid>
+
+        <!-- 1 历史会话 -->
+        <Grid IsVisible="{Binding SelectedPage, Converter={StaticResource PageVisibilityConverter}, ConverterParameter=1}">
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+          </Grid.RowDefinitions>
+          <TextBlock Text="历史会话" Classes="pageTitle"/>
+          <Grid Grid.Row="1" Margin="0,0,0,8">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition/>
+              <ColumnDefinition Width="10"/>
+              <ColumnDefinition Width="210"/>
+              <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBox Watermark="搜索历史会话" Text="{Binding SessionSearch, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+            <ComboBox Grid.Column="2" ItemsSource="{Binding SessionProjects}" SelectedItem="{Binding SessionProject, Mode=TwoWay}"/>
+            <TextBlock Grid.Column="3" Text="{Binding SessionVisibleCount, StringFormat=结果 {0:N0}}" VerticalAlignment="Center" Margin="12,0,0,0"/>
+          </Grid>
+          <Grid Grid.Row="2">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="*"/>
+              <ColumnDefinition Width="8"/>
+              <ColumnDefinition Width="360"/>
+            </Grid.ColumnDefinitions>
+            <Grid>
+              <DataGrid x:Name="SessionsGrid" ItemsSource="{Binding FilteredSessions}" SelectionMode="Extended" AutoGenerateColumns="False">
+                <DataGrid.Columns>
+                  <DataGridTextColumn Header="会话" Binding="{Binding Title}" Width="2*"/>
+                  <DataGridTextColumn Header="项目" Binding="{Binding ProjectName}" Width="*"/>
+                  <DataGridTextColumn Header="来源" Binding="{Binding Source, Converter={StaticResource SessionSourceConverter}}" Width="90"/>
+                  <DataGridTextColumn Header="本地时间" Binding="{Binding LastWriteTimeUtc, Converter={StaticResource UtcToLocalTimeConverter}}" Width="145"/>
+                  <DataGridTextColumn Header="大小" Binding="{Binding Size, Converter={StaticResource ByteSizeConverter}}" Width="100"/>
+                  <DataGridTextColumn Header="路径" Binding="{Binding DisplayPath}" Width="2*"/>
+                </DataGrid.Columns>
+                <DataGrid.ContextMenu>
+                  <ContextMenu>
+                    <MenuItem Header="打开所在位置" Click="OpenSelectedLocation_Click"/>
+                  </ContextMenu>
+                </DataGrid.ContextMenu>
+              </DataGrid>
+              <Border Background="{DynamicResource SurfaceBrush}" IsVisible="{Binding IsSessionFilterEmpty}">
+                <TextBlock Text="没有符合筛选条件的历史会话" HorizontalAlignment="Center" VerticalAlignment="Center" Classes="muted"/>
+              </Border>
+            </Grid>
+            <Border Grid.Column="2" Classes="card" Padding="12">
+              <Grid>
+                <Grid.RowDefinitions>
+                  <RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/>
+                  <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+                <TextBlock Text="{Binding SessionPreviewTitle}" FontWeight="SemiBold" TextWrapping="Wrap"/>
+                <TextBlock Grid.Row="1" Text="{Binding SessionPreviewStatus}" Classes="muted" TextWrapping="Wrap" Margin="0,6,0,8"/>
+                <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto">
+                  <ItemsControl ItemsSource="{Binding SessionPreviewMessages}">
+                    <ItemsControl.ItemTemplate>
+                      <DataTemplate>
+                        <Border Margin="0,0,0,8" Padding="8" Background="{DynamicResource SurfaceAltBrush}" CornerRadius="4">
+                          <StackPanel>
+                            <TextBlock Text="{Binding DisplayRole}" FontWeight="SemiBold" Foreground="{Binding Role, Converter={StaticResource SessionRoleBrushConverter}}"/>
+                            <TextBlock Text="{Binding Text}" TextWrapping="Wrap" Margin="0,4,0,0"/>
+                          </StackPanel>
+                        </Border>
+                      </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                  </ItemsControl>
+                </ScrollViewer>
+              </Grid>
+            </Border>
+          </Grid>
+          <Grid Grid.Row="3" Margin="0,10,0,0">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition/>
+              <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <StackPanel>
+              <TextBlock Text="{Binding SelectedSessionCount, StringFormat=已选 {0:N0} 项}"/>
+              <TextBlock Text="{Binding OperationStatus}" Foreground="{Binding OperationStatusSeverity, Converter={StaticResource StatusBrushConverter}}" Margin="0,4,12,0" TextWrapping="Wrap"/>
+            </StackPanel>
+            <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+              <Button x:Name="DeleteSelectedButton" Classes="primary" Content="删除所选会话" Command="{Binding DeleteSelectedSessionsCommand}"/>
+              <Button Command="{Binding CancelCleanupCommand}" Content="取消清理" IsVisible="{Binding IsCleaning}"/>
+            </StackPanel>
+          </Grid>
+        </Grid>
+
+        <!-- 2 工作区 -->
+        <Grid IsVisible="{Binding SelectedPage, Converter={StaticResource PageVisibilityConverter}, ConverterParameter=2}">
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+          </Grid.RowDefinitions>
+          <TextBlock Text="工作区" Classes="pageTitle"/>
+          <Grid Grid.Row="1" Margin="0,0,0,8">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition/>
+              <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBox Watermark="搜索工作区" Text="{Binding WorkspaceSearch, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+            <TextBlock Grid.Column="1" Text="{Binding WorkspaceVisibleCount, StringFormat=结果 {0:N0}}" VerticalAlignment="Center" Margin="12,0,0,0"/>
+          </Grid>
+          <Grid Grid.Row="2">
+            <DataGrid x:Name="WorkspaceGrid" ItemsSource="{Binding FilteredWorkspaces}" SelectionMode="Extended" AutoGenerateColumns="False">
+              <DataGrid.Columns>
+                <DataGridTextColumn Header="工作区" Binding="{Binding DisplayName}" Width="*"/>
+                <DataGridTextColumn Header="项目路径" Binding="{Binding ProjectPath}" Width="2*"/>
+                <DataGridTextColumn Header="建议" Binding="{Binding ProjectMissing, Converter={StaticResource WorkspaceRecommendationConverter}}" Width="180"/>
+                <DataGridTextColumn Header="本地时间" Binding="{Binding LastWriteTimeUtc, Converter={StaticResource UtcToLocalTimeConverter}}" Width="145"/>
+                <DataGridTextColumn Header="大小" Binding="{Binding TotalBytes, Converter={StaticResource ByteSizeConverter}}" Width="100"/>
+                <DataGridTextColumn Header="文件" Binding="{Binding FileCount}" Width="80"/>
+              </DataGrid.Columns>
+              <DataGrid.ContextMenu>
+                <ContextMenu>
+                  <MenuItem Header="打开所在位置" Click="OpenSelectedLocation_Click"/>
+                </ContextMenu>
+              </DataGrid.ContextMenu>
+            </DataGrid>
+            <Border Background="{DynamicResource SurfaceBrush}" IsVisible="{Binding IsWorkspaceFilterEmpty}">
+              <TextBlock Text="没有符合筛选条件的工作区" HorizontalAlignment="Center" VerticalAlignment="Center" Classes="muted"/>
+            </Border>
+          </Grid>
+          <Grid Grid.Row="3" Margin="0,10,0,0">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition/>
+              <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Text="{Binding SelectedWorkspaceCount, StringFormat=已选 {0:N0} 项}" VerticalAlignment="Center"/>
+            <StackPanel Grid.Column="1" Orientation="Horizontal">
+              <Button x:Name="GenerateSelectedWorkspaceButton" Content="为所选工作区生成预览" Command="{Binding GenerateSelectedWorkspacePreviewCommand}"/>
+              <Button Classes="primary" Content="为全部数据生成预览" Command="{Binding GeneratePreviewCommand}"/>
+            </StackPanel>
+          </Grid>
+        </Grid>
+
+        <!-- 3 空间分析 -->
+        <Grid IsVisible="{Binding SelectedPage, Converter={StaticResource PageVisibilityConverter}, ConverterParameter=3}">
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+          </Grid.RowDefinitions>
+          <TextBlock Text="空间分析" Classes="pageTitle"/>
+          <Border Grid.Row="1" Classes="card" Margin="0,0,0,12">
+            <Grid>
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="16"/>
+                <ColumnDefinition Width="280"/>
+              </Grid.ColumnDefinitions>
+              <StackPanel>
+                <TextBlock Text="清理策略" Classes="sectionHeader"/>
+                <RadioButton Content="按保留期限" IsChecked="{Binding IsRetentionPolicy, Mode=TwoWay}" GroupName="CleanupPolicy"/>
+                <ComboBox Width="120" HorizontalAlignment="Left" Margin="22,4,0,8"
+                          ItemsSource="{Binding RetentionOptions}" SelectedItem="{Binding RetentionDays, Mode=TwoWay}"
+                          IsEnabled="{Binding IsRetentionPolicy}"/>
+                <RadioButton Content="按截止日期" IsChecked="{Binding IsCutoffPolicy, Mode=TwoWay}" GroupName="CleanupPolicy"/>
+                <DatePicker Margin="22,4,0,0" HorizontalAlignment="Left" Width="200"
+                            SelectedDate="{Binding CustomCutoff, Mode=TwoWay, Converter={StaticResource DateTimeOffsetConverter}}"
+                            IsEnabled="{Binding IsCutoffPolicy}"/>
+              </StackPanel>
+              <StackPanel Grid.Column="2">
+                <TextBlock Text="{Binding PreviewStatus}" TextWrapping="Wrap"/>
+                <TextBlock Text="{Binding PreviewFiles, StringFormat=文件 {0:N0}}" Margin="0,8,0,0"/>
+                <TextBlock Text="{Binding PreviewWorkspaces, StringFormat=工作区 {0:N0}}"/>
+                <TextBlock Text="{Binding PreviewSessions, StringFormat=会话 {0:N0}}"/>
+                <TextBlock Text="{Binding PreviewBytes, Converter={StaticResource ByteSizeConverter}, StringFormat=预计释放 {0}}"/>
+                <TextBlock Text="{Binding RecycleBinModeLabel, StringFormat=删除模式：{0}}" Classes="muted" Margin="0,8,0,0" IsVisible="{Binding UseRecycleBin}"/>
+                <TextBlock Text="删除模式：永久删除" Classes="muted" Margin="0,8,0,0" IsVisible="{Binding UseRecycleBin, Converter={StaticResource BoolVisibilityConverter}, ConverterParameter=Invert}"/>
+                <TextBlock Text="{Binding OperationStatus}" Foreground="{Binding OperationStatusSeverity, Converter={StaticResource StatusBrushConverter}}" TextWrapping="Wrap" Margin="0,8,0,0"/>
+              </StackPanel>
+            </Grid>
+          </Border>
+          <DataGrid Grid.Row="2" ItemsSource="{Binding LargeFiles}" AutoGenerateColumns="False">
+            <DataGrid.Columns>
+              <DataGridTextColumn Header="路径" Binding="{Binding FullPath}" Width="3*"/>
+              <DataGridTextColumn Header="类型" Binding="{Binding Category, Converter={StaticResource DataCategoryConverter}}" Width="110"/>
+              <DataGridTextColumn Header="本地时间" Binding="{Binding LastWriteTimeUtc, Converter={StaticResource UtcToLocalTimeConverter}}" Width="145"/>
+              <DataGridTextColumn Header="大小" Binding="{Binding Size, Converter={StaticResource ByteSizeConverter}}" Width="100"/>
+            </DataGrid.Columns>
+            <DataGrid.ContextMenu>
+              <ContextMenu>
+                <MenuItem Header="打开所在位置" Click="OpenSelectedLocation_Click"/>
+              </ContextMenu>
+            </DataGrid.ContextMenu>
+          </DataGrid>
+          <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,10,0,0">
+            <Button Content="生成清理预览" Command="{Binding GeneratePreviewCommand}"/>
+            <Button Classes="primary" Content="执行清理" Command="{Binding CleanupCommand}"/>
+            <Button Content="取消清理" Command="{Binding CancelCleanupCommand}" IsVisible="{Binding IsCleaning}"/>
+          </StackPanel>
+        </Grid>
+
+        <!-- 4 高级工具 -->
+        <Grid IsVisible="{Binding SelectedPage, Converter={StaticResource PageVisibilityConverter}, ConverterParameter=4}">
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+          </Grid.RowDefinitions>
+          <TextBlock Text="高级工具" Classes="pageTitle"/>
+          <Border Grid.Row="1" Classes="card" Margin="0,0,0,12" Background="{DynamicResource WarningBackgroundBrush}">
+            <TextBlock Text="SQLite VACUUM 会改写数据库文件。必须关闭 Cursor；执行前会强制在线备份。结构不认识或备份失败时不会写入。" TextWrapping="Wrap" Foreground="{DynamicResource WarningBrush}"/>
+          </Border>
+          <DataGrid Grid.Row="2" x:Name="DatabasesGrid" ItemsSource="{Binding Databases}" SelectedItem="{Binding SelectedDatabase, Mode=TwoWay}" AutoGenerateColumns="False" IsEnabled="{Binding CanEditTargets}">
+            <DataGrid.Columns>
+              <DataGridTextColumn Header="数据库" Binding="{Binding RelativePath}" Width="2*"/>
+              <DataGridTextColumn Header="路径" Binding="{Binding FullPath}" Width="3*"/>
+              <DataGridTextColumn Header="大小" Binding="{Binding Size, Converter={StaticResource ByteSizeConverter}}" Width="100"/>
+            </DataGrid.Columns>
+          </DataGrid>
+          <Grid Grid.Row="3" Margin="0,10,0,0">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition/>
+              <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <StackPanel>
+              <TextBlock Text="{Binding SqliteStatus}" Foreground="{Binding SqliteStatusSeverity, Converter={StaticResource StatusBrushConverter}}" TextWrapping="Wrap"/>
+              <TextBlock Text="{Binding SqliteBefore, Converter={StaticResource ByteSizeConverter}, StringFormat=维护前 {0}}" Classes="muted" Margin="0,4,0,0"/>
+              <TextBlock Text="{Binding SqliteAfter, Converter={StaticResource ByteSizeConverter}, StringFormat=维护后 {0}}" Classes="muted"/>
+              <TextBlock Text="{Binding SqliteReclaimed, Converter={StaticResource ByteSizeConverter}, StringFormat=回收 {0}}" Classes="muted"/>
+              <TextBlock Text="{Binding SqliteBackupPath, StringFormat=备份 {0}}" Classes="muted" TextTrimming="CharacterEllipsis"/>
+            </StackPanel>
+            <Button Grid.Column="1" Classes="primary" Content="检查、备份并优化" Command="{Binding VacuumCommand}" VerticalAlignment="Center"/>
+          </Grid>
+        </Grid>
+
+        <!-- 5 设置 -->
+        <ScrollViewer IsVisible="{Binding SelectedPage, Converter={StaticResource PageVisibilityConverter}, ConverterParameter=5}" VerticalScrollBarVisibility="Auto">
+          <StackPanel>
+            <TextBlock Text="设置" Classes="pageTitle"/>
+            <StackPanel IsEnabled="{Binding CanEditTargets}">
+              <Border Classes="card" Margin="0,0,0,10">
+                <Grid>
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="180"/>
+                    <ColumnDefinition Width="*"/>
+                  </Grid.ColumnDefinitions>
+                  <TextBlock Text="清理方式" Classes="sectionHeader"/>
+                  <StackPanel Grid.Column="1">
+                    <CheckBox Content="清理前自动备份" IsChecked="{Binding AutomaticBackup, Mode=TwoWay}"/>
+                    <CheckBox Content="{Binding RecycleBinSettingLabel}" IsChecked="{Binding UseRecycleBin, Mode=TwoWay}"/>
+                  </StackPanel>
+                </Grid>
+              </Border>
+              <Border Classes="card" Margin="0,0,0,10">
+                <Grid>
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="180"/>
+                    <ColumnDefinition Width="*"/>
+                  </Grid.ColumnDefinitions>
+                  <TextBlock Text="扫描显示范围" Classes="sectionHeader"/>
+                  <StackPanel Grid.Column="1">
+                    <TextBlock Text="这些选项筛选显示结果和允许生成清理计划的数据根。" Classes="muted" TextWrapping="Wrap" Margin="0,0,0,4"/>
+                    <CheckBox Content="{Binding ScanRoamingLabel}" IsChecked="{Binding ScanRoamingData, Mode=TwoWay}"/>
+                    <CheckBox Content="{Binding ScanLocalLabel}" IsChecked="{Binding ScanLocalData, Mode=TwoWay}"/>
+                    <CheckBox Content="{Binding ScanUserProfileLabel}" IsChecked="{Binding ScanUserProfile, Mode=TwoWay}"/>
+                    <TextBlock Text="正在刷新范围" IsVisible="{Binding IsScopeRefreshing}" Classes="muted"/>
+                  </StackPanel>
+                </Grid>
+              </Border>
+              <Border Classes="card" Margin="0,0,0,10">
+                <Grid>
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="180"/>
+                    <ColumnDefinition Width="*"/>
+                  </Grid.ColumnDefinitions>
+                  <TextBlock Text="高级功能" Classes="sectionHeader"/>
+                  <StackPanel Grid.Column="1">
+                    <CheckBox Content="显示高级功能" IsChecked="{Binding AdvancedFeaturesEnabled, Mode=TwoWay}"/>
+                    <TextBlock Text="开启后显示工作区和空间分析页，可按保留期生成批量清理预览。" Classes="muted" TextWrapping="Wrap" Margin="22,0,0,8"/>
+                    <CheckBox Content="启用 SQLite 高级工具" IsChecked="{Binding AdvancedToolsEnabled, Mode=TwoWay}"/>
+                    <TextBlock Text="开启后显示高级工具页，可对已批准根内的数据库执行检查、备份和 VACUUM。" Classes="muted" TextWrapping="Wrap" Margin="22,0,0,0"/>
+                  </StackPanel>
+                </Grid>
+              </Border>
+              <Border Classes="card">
+                <Grid>
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="180"/>
+                    <ColumnDefinition Width="*"/>
+                  </Grid.ColumnDefinitions>
+                  <TextBlock Text="外观" Classes="sectionHeader"/>
+                  <StackPanel Grid.Column="1">
+                    <Grid>
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="100"/>
+                        <ColumnDefinition Width="170"/>
+                      </Grid.ColumnDefinitions>
+                      <TextBlock Text="主题" VerticalAlignment="Center"/>
+                      <ComboBox Grid.Column="1" ItemsSource="{Binding ThemeOptions}" SelectedItem="{Binding Theme, Mode=TwoWay}">
+                        <ComboBox.ItemTemplate>
+                          <DataTemplate>
+                            <TextBlock Text="{Binding Converter={StaticResource ThemeConverter}}"/>
+                          </DataTemplate>
+                        </ComboBox.ItemTemplate>
+                      </ComboBox>
+                    </Grid>
+                    <TextBlock Text="{Binding SettingsStatus}" Foreground="{Binding SettingsStatusSeverity, Converter={StaticResource StatusBrushConverter}}" Margin="0,6,0,0" TextWrapping="Wrap"/>
+                  </StackPanel>
+                </Grid>
+              </Border>
+            </StackPanel>
+            <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
+              <Button Command="{Binding SaveSettingsCommand}" Classes="primary" Content="保存设置"/>
+              <Button Command="{Binding OpenLogsCommand}" Content="打开日志"/>
+              <Button Command="{Binding OpenDataDirectoryCommand}" Content="打开应用数据目录"/>
+            </StackPanel>
+          </StackPanel>
+        </ScrollViewer>
+      </Grid>
+    </Grid>
+
+    <Border Grid.Row="2" Background="{DynamicResource SurfaceBrush}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="0,1,0,0" Padding="12,6">
+      <Grid>
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition/>
+          <ColumnDefinition Width="180"/>
+        </Grid.ColumnDefinitions>
+        <TextBlock Text="{Binding DataDirectory, StringFormat=数据目录：{0}}" Classes="muted" TextTrimming="CharacterEllipsis" ToolTip.Tip="{Binding DataDirectory}" Margin="0,0,12,0"/>
+        <TextBlock Grid.Column="1" Text="{Binding LastScanText, StringFormat=最近扫描：{0}}" Classes="muted" HorizontalAlignment="Right"/>
+      </Grid>
+    </Border>
+
+    <Border Grid.RowSpan="3" ZIndex="100" Background="#90000000" IsVisible="{Binding IsClosing}">
+      <Border Background="{DynamicResource SurfaceBrush}" BorderBrush="{DynamicResource StrongBorderBrush}" BorderThickness="1" CornerRadius="6" Padding="24" HorizontalAlignment="Center" VerticalAlignment="Center" MaxWidth="480">
+        <StackPanel>
+          <ProgressBar IsIndeterminate="True" Width="340"/>
+          <TextBlock Text="{Binding ClosingStatus}" Margin="0,12,0,0" TextWrapping="Wrap" TextAlignment="Center"/>
+        </StackPanel>
+      </Border>
+    </Border>
+  </Grid>
+</Window>

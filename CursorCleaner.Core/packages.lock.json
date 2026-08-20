@@ -1,7 +1,7 @@
 {
   "version": 1,
   "dependencies": {
-    "net8.0-windows7.0": {
+    "net8.0": {
       "Microsoft.Data.Sqlite": {
         "type": "Direct",
         "requested": "[8.0.30, 8.0.30]",
@@ -11,12 +11,6 @@
           "Microsoft.Data.Sqlite.Core": "8.0.30",
           "SQLitePCLRaw.bundle_e_sqlite3": "2.1.12"
         }
-      },
-      "Microsoft.NET.ILLink.Tasks": {
-        "type": "Direct",
-        "requested": "[8.0.30, )",
-        "resolved": "8.0.30",
-        "contentHash": "SfmwuZjUPBTEoBMAsXZ/hWkaEK9oL+Y/UtAx7N6RyWHfcMt9J0ExrNPuOgTyPbCXIyiTBFsxFNrPLEZNPmJcvA=="
       },
       "Microsoft.Data.Sqlite.Core": {
         "type": "Transitive",
@@ -62,7 +56,7 @@
         "contentHash": "3oDzvc/zzetpTKWMShs1AADwZjQ/36HnsufHRPcOjyRAAMLDlu2iD33MBI2opxnezcVUtXyqDXXjoFMOU9c7SA=="
       }
     },
-    "net8.0-windows7.0/win-x64": {
+    "net8.0/osx-arm64": {
       "SQLitePCLRaw.lib.e_sqlite3": {
         "type": "Transitive",
         "resolved": "2.1.12",
