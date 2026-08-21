@@ -3,6 +3,7 @@
         x:Class="CursorCleaner.MainWindow"
         x:Name="RootWindow"
         Title="Cursor Cleaner"
+        Icon="avares://CursorCleaner/Assets/app.ico"
         Width="1220" Height="760" MinWidth="920" MinHeight="600"
         WindowStartupLocation="CenterScreen">
   <Grid Background="{DynamicResource WindowBrush}">

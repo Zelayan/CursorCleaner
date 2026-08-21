@@ -7,6 +7,7 @@
     <RootNamespace>CursorCleaner</RootNamespace>
     <AssemblyName>CursorCleaner</AssemblyName>
     <ApplicationTitle>Cursor Cleaner</ApplicationTitle>
+    <ApplicationIcon>Assets\app.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <BuiltInComInteropSupport>true</BuiltInComInteropSupport>
     <AvaloniaUseCompiledBindingsByDefault>false</AvaloniaUseCompiledBindingsByDefault>
@@ -28,20 +29,26 @@
     <PackageReference Include="Avalonia.Controls.DataGrid" Version="11.2.7" />
   </ItemGroup>
   <ItemGroup>
+    <AvaloniaResource Include="Assets\app.ico" />
+    <AvaloniaResource Include="Assets\app-icon.png" />
     <None Include="Mac\Info.plist" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="Mac\AppIcon.icns" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
   <Target Name="CreateMacAppBundle" AfterTargets="Publish" Condition="'$(RuntimeIdentifier)' == 'osx-arm64'">
     <PropertyGroup>
       <MacAppBundle>$(PublishDir)CursorCleaner.app</MacAppBundle>
       <MacAppContents>$(MacAppBundle)\Contents</MacAppContents>
       <MacAppMacOS>$(MacAppContents)\MacOS</MacAppMacOS>
+      <MacAppResources>$(MacAppContents)\Resources</MacAppResources>
     </PropertyGroup>
     <ItemGroup>
-      <MacPublishFiles Include="$(PublishDir)**\*" Exclude="$(MacAppBundle)\**\*" />
+      <MacPublishFiles Include="$(PublishDir)**\*" Exclude="$(MacAppBundle)\**\*;$(PublishDir)Mac\**\*" />
     </ItemGroup>
     <RemoveDir Directories="$(MacAppBundle)" Condition="Exists('$(MacAppBundle)')" />
     <MakeDir Directories="$(MacAppMacOS)" />
+    <MakeDir Directories="$(MacAppResources)" />
     <Copy SourceFiles="$(MSBuildProjectDirectory)\Mac\Info.plist" DestinationFiles="$(MacAppContents)\Info.plist" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\Mac\AppIcon.icns" DestinationFiles="$(MacAppResources)\AppIcon.icns" />
     <Copy SourceFiles="@(MacPublishFiles)" DestinationFiles="@(MacPublishFiles->'$(MacAppMacOS)\%(RecursiveDir)%(Filename)%(Extension)')" />
   </Target>
 </Project>
