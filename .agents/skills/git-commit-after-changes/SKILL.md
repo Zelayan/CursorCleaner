@@ -65,3 +65,29 @@ If `packages.lock.json` changed only because of a RID-specific restore, restore 
 ## After the commit
 
 Tell the user the commit hash and subject. If they also asked to push or release, do that next. Otherwise stop after the commit; do not push on your own.
+
+## GitHub releases
+
+When the user asks to 发布 / release, create the GitHub release after packaging. Write **release notes in Chinese**, not English.
+
+Keep the notes short: what changed for the user, then the standing safety lines. Do not paste commit subjects or internal file names unless the user-facing change needs them.
+
+Template:
+
+```text
+<用一两段中文写用户能感知的变化。>
+
+附件为 Windows 自包含 EXE 和未签名的 macOS Apple Silicon 应用。清理前请关闭 Cursor。文件会进入回收站 / 废纸篓，清空后才会真正释放磁盘空间。删除 SQLite 行不会立刻缩小数据库，需要时可手动优化。
+```
+
+Example for a UI flatten:
+
+```text
+所有页面始终可见。总览、历史会话、工作区、空间分析和数据库工具不再藏在高级开关后面。
+
+清理确认框会按文件名汇总多个 SQLite 数据库及其总大小，不再逐条列出每个 `state.vscdb`。
+
+附件为 Windows 自包含 EXE 和未签名的 macOS Apple Silicon 应用。清理前请关闭 Cursor。文件会进入回收站 / 废纸篓，清空后才会真正释放磁盘空间。删除 SQLite 行不会立刻缩小数据库，需要时可手动优化。
+```
+
+If an already-published release has English notes, edit it to Chinese with `gh release edit` instead of creating a duplicate. Tag names such as `v0.4.0` stay as-is.
