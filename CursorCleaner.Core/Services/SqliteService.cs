@@ -378,7 +378,10 @@ public sealed class SqliteService : ISqliteService
             var shape = await CursorChatSchema.DiscoverAsync(connection, cancellationToken).ConfigureAwait(false);
             if (!shape.IsRecognized)
             {
-                return new SqliteChatDatabaseResult(path, false, 0, null, "Database schema is not a recognized Cursor chat store; no rows were deleted.");
+                // Workspace state.vscdb files only hold ItemTable; they are not chat
+                // stores, so an unrecognized schema is a skip, not a failure.
+                Report(progress, SqliteProgressStage.Completed, path, databaseIndex, databaseCount, 100);
+                return new SqliteChatDatabaseResult(path, true, 0, null, "Skipped: not a Cursor chat store; no rows were deleted.");
             }
 
             if (!await CursorChatSchema.HasChatDataAsync(connection, shape, cancellationToken).ConfigureAwait(false))

@@ -340,7 +340,7 @@ public sealed class SqliteServiceTests
     }
 
     [TestMethod]
-    public async Task DeleteChatRecords_UnknownSchemaDoesNotWrite()
+    public async Task DeleteChatRecords_UnknownSchemaSkipsWithoutBlocking()
     {
         using var temp = new TemporaryDirectory();
         var root = Path.Combine(temp.Path, "approved");
@@ -355,8 +355,11 @@ public sealed class SqliteServiceTests
             [database],
             [root]);
 
-        Assert.IsFalse(result.Succeeded);
-        StringAssert.Contains(result.Error!, "recognized");
+        // Workspace state.vscdb files are not chat stores; skipping them must not
+        // fail the batch or block session file deletion.
+        Assert.IsTrue(result.Succeeded, result.Error);
+        StringAssert.Contains(result.Databases[0].Error!, "not a Cursor chat store");
+        Assert.AreEqual(0, result.DeletedRows);
         CollectionAssert.AreEqual(original, await File.ReadAllBytesAsync(database));
         Assert.IsNull(result.Databases[0].BackupPath);
     }
