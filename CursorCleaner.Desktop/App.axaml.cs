@@ -2,6 +2,7 @@ using Avalonia;
 using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Markup.Xaml;
 using Avalonia.Styling;
+using CursorCleaner.Helpers;
 using CursorCleaner.Models;
 using CursorCleaner.Services;
 using CursorCleaner.ViewModels;
@@ -27,20 +28,25 @@ public partial class App : Application
             _log = new LogService();
             var sessionAnalyzer = new SessionAnalyzerService(_log);
             var settings = new SettingsService(_log);
+            var loadedSettings = settings.LoadAsync().GetAwaiter().GetResult();
             var roots = pathService.GetDataRoots().Select(root => root.Path).ToArray();
             var pathGuard = new PathGuard(roots);
             var planner = new CleanupPlannerService(pathGuard);
-            var backup = new BackupService(_log);
+            var backupRoot = string.IsNullOrWhiteSpace(loadedSettings.BackupDirectory)
+                ? AppStorage.DefaultBackupRoot
+                : loadedSettings.BackupDirectory;
+            var backup = new BackupService(_log, backupRoot);
             var recycleBin = RecycleBinService.CreateDefault();
             var cleanup = new CleanupService(process, pathGuard, backup, recycleBin, _log);
             var shell = new ShellService(_log);
             var sqlite = new SqliteService(process, pathGuard, backup, _log);
             var sessionContent = new SessionContentService(pathGuard);
             var dialogs = new AvaloniaDialogService();
+            var folderPicker = new AvaloniaFolderPickerService();
             _theme = new AvaloniaThemeService(this);
             var viewModel = new MainViewModel(
                 pathService, scanner, workspaceAnalyzer, sessionAnalyzer,
-                store, process, _log, settings, planner, cleanup, shell, sqlite, dialogs, sessionContent, _theme, backup);
+                store, process, _log, settings, planner, cleanup, shell, sqlite, dialogs, sessionContent, _theme, backup, folderPicker);
             desktop.MainWindow = new MainWindow(viewModel);
             desktop.ShutdownRequested += (_, e) =>
             {

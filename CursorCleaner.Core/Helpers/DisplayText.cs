@@ -83,6 +83,7 @@ public static class DisplayText
             : $"{fileName}：";
         return stage switch
         {
+            SqliteProgressStage.CheckingSpace => prefix + "正在检查磁盘空间",
             SqliteProgressStage.Checking => prefix + "正在完整性检查（大库可能需数分钟）",
             SqliteProgressStage.PreparingBackup => prefix + "正在准备在线备份",
             SqliteProgressStage.BackingUp => percent is int value

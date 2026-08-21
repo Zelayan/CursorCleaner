@@ -844,6 +844,82 @@ public sealed class MainViewModelTests
     }
 
     [TestMethod]
+    public async Task ChooseBackupDirectory_ValidatesPersistsAndSupportsReset()
+    {
+        await RunStaAsync(async () =>
+        {
+            using var temp = new TemporaryDirectory();
+            var root = new CursorDataRoot(Path.Combine(temp.Path, "Cursor"), RootKind.RoamingData, "test");
+            Directory.CreateDirectory(root.Path);
+            var picker = new StubFolderPicker(Path.Combine(temp.Path, "D盘 备份"));
+            var settings = new MemorySettingsService();
+            using var viewModel = CreateViewModel(
+                new FixedScanner(Result()), new ScanResultStore(),
+                new FixedWorkspaceAnalyzer([]), new FixedSessionAnalyzer([]),
+                settings: settings,
+                pathService: new FixedPathService(root),
+                folderPicker: picker);
+
+            Assert.AreEqual(AppStorage.DefaultBackupRoot, viewModel.EffectiveBackupDirectory);
+            StringAssert.Contains(viewModel.BackupDirectoryHint, "当前备份目录");
+
+            picker.NextPath = Path.Combine(root.Path, "inside");
+            await viewModel.ChooseBackupDirectoryCommand.ExecuteAsync(null);
+
+            Assert.IsNull(settings.Saved?.BackupDirectory);
+            StringAssert.Contains(viewModel.SettingsStatus, "不能位于 Cursor 数据目录内");
+
+            picker.NextPath = Path.Combine(temp.Path, "relative");
+            await viewModel.ChooseBackupDirectoryCommand.ExecuteAsync(null);
+
+            picker.NextPath = Path.Combine(temp.Path, "D盘 备份");
+            await viewModel.ChooseBackupDirectoryCommand.ExecuteAsync(null);
+
+            Assert.IsNotNull(settings.Saved is null && viewModel.IsSettingsDirty);
+            Assert.IsTrue(viewModel.IsSettingsDirty);
+            Assert.AreEqual(Path.Combine(temp.Path, "D盘 备份"), viewModel.EffectiveBackupDirectory);
+            StringAssert.Contains(viewModel.BackupDirectoryHint, "下次启动生效");
+            StringAssert.Contains(viewModel.SettingsStatus, "下次启动生效");
+
+            await viewModel.SaveSettingsCommand.ExecuteAsync(null);
+
+            Assert.IsFalse(viewModel.IsSettingsDirty);
+            Assert.AreEqual(Path.Combine(temp.Path, "D盘 备份"), settings.Saved?.BackupDirectory);
+
+            viewModel.ResetBackupDirectoryCommand.Execute(null);
+
+            Assert.AreEqual(AppStorage.DefaultBackupRoot, viewModel.EffectiveBackupDirectory);
+            Assert.IsTrue(viewModel.IsSettingsDirty);
+        });
+    }
+
+    [TestMethod]
+    public async Task ChooseBackupDirectory_CancelKeepsSettingsUntouched()
+    {
+        await RunStaAsync(async () =>
+        {
+            var picker = new StubFolderPicker(null);
+            using var viewModel = CreateViewModel(
+                new FixedScanner(Result()), new ScanResultStore(),
+                new FixedWorkspaceAnalyzer([]), new FixedSessionAnalyzer([]),
+                folderPicker: picker);
+
+            await viewModel.ChooseBackupDirectoryCommand.ExecuteAsync(null);
+
+            Assert.IsFalse(viewModel.IsSettingsDirty);
+            Assert.AreEqual(AppStorage.DefaultBackupRoot, viewModel.EffectiveBackupDirectory);
+        });
+    }
+
+    private sealed class StubFolderPicker(string? nextPath) : IFolderPickerService
+    {
+        public string? NextPath { get; set; } = nextPath;
+
+        public Task<string?> PickFolderAsync(string title, string? suggestedPath = null, CancellationToken cancellationToken = default) =>
+            Task.FromResult(NextPath);
+    }
+
+    [TestMethod]
     public void BulkObservableCollection_ReplaceRangeRaisesOneReset()
     {
         var collection = new BulkObservableCollection<int> { 9 };
@@ -869,7 +945,8 @@ public sealed class MainViewModelTests
         ISessionContentService? sessionContent = null,
         ISqliteService? sqlite = null,
         IBackupService? backup = null,
-        IProcessService? process = null)
+        IProcessService? process = null,
+        IFolderPickerService? folderPicker = null)
     {
         pathService ??= new FixedPathService();
         return new(
@@ -880,7 +957,8 @@ public sealed class MainViewModelTests
             sqlite ?? new NullSqliteService(), dialogs ?? new NullDialogService(),
             sessionContent ?? new NullSessionContentService(),
             new NullThemeService(),
-            backup ?? new NullBackupService());
+            backup ?? new NullBackupService(),
+            folderPicker);
     }
 
     private static ScanItem Item(CursorDataRoot root, string relative, DataCategory category, DateTime? time = null) =>
@@ -1018,8 +1096,13 @@ public sealed class MainViewModelTests
     private sealed class MemorySettingsService : ISettingsService
     {
         public string SettingsPath => Path.Combine(Path.GetTempPath(), "settings.json");
+        public OperationSettings? Saved { get; private set; }
         public Task<OperationSettings> LoadAsync(CancellationToken cancellationToken = default) => Task.FromResult(new OperationSettings());
-        public Task SaveAsync(OperationSettings settings, CancellationToken cancellationToken = default) => Task.CompletedTask;
+        public Task SaveAsync(OperationSettings settings, CancellationToken cancellationToken = default)
+        {
+            Saved = settings;
+            return Task.CompletedTask;
+        }
     }
     private sealed class BlockingSettingsService : ISettingsService
     {
@@ -1142,6 +1225,10 @@ public sealed class MainViewModelTests
             throw new NotSupportedException();
         public Task<string> CommitSqliteBackupAsync(string stagingPath, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
+        public SqliteSpacePlan CreateSqliteSpacePlan(string databasePath, bool includeVacuum) =>
+            throw new NotSupportedException();
+        public SqliteSpaceFailure? CheckSqliteSpace(SqliteSpacePlan plan, SqliteSpaceFailureStage stage, bool backupWasKept = false) => null;
+        public SqliteSpaceFailure? CheckVacuumSpace(string databasePath, bool backupWasKept = true) => null;
         public void EnsureVolumeFreeSpace(string pathOnVolume, long requiredBytes, string operationLabel) { }
         public SqliteBackupUsage GetSqliteBackupUsage() => new(BackupRootPath, 0, 0, 0, 0);
         public Task<SqliteBackupCleanupResult> CleanupLegacySqliteBackupsAsync(CancellationToken cancellationToken = default) =>
@@ -1167,6 +1254,10 @@ public sealed class MainViewModelTests
             throw new NotSupportedException();
         public Task<string> CommitSqliteBackupAsync(string stagingPath, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
+        public SqliteSpacePlan CreateSqliteSpacePlan(string databasePath, bool includeVacuum) =>
+            throw new NotSupportedException();
+        public SqliteSpaceFailure? CheckSqliteSpace(SqliteSpacePlan plan, SqliteSpaceFailureStage stage, bool backupWasKept = false) => null;
+        public SqliteSpaceFailure? CheckVacuumSpace(string databasePath, bool backupWasKept = true) => null;
         public void EnsureVolumeFreeSpace(string pathOnVolume, long requiredBytes, string operationLabel) { }
         public SqliteBackupUsage GetSqliteBackupUsage() => Usage;
         public Task<SqliteBackupCleanupResult> CleanupLegacySqliteBackupsAsync(CancellationToken cancellationToken = default)

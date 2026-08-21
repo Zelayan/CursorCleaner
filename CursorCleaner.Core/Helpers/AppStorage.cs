@@ -22,4 +22,8 @@ public static class AppStorage
     }
 
     public static string DefaultLogs => Path.Combine(DefaultRoot, "logs");
+
+    public static string DefaultBackupRoot => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        "CursorCleanerBackup");
 }

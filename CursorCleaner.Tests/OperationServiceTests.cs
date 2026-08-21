@@ -75,6 +75,83 @@ public sealed class OperationServiceTests
     }
 
     [TestMethod]
+    public void Backup_SpacePlanComputesJointPeakForSameVolume()
+    {
+        using var temp = new TemporaryDirectory();
+        var log = new LogService(Path.Combine(temp.Path, "logs"));
+        var backupRoot = Path.Combine(temp.Path, "backups");
+        var database = Path.Combine(temp.Path, "state.vscdb");
+        File.WriteAllText(database, new string('a', 1000));
+        var backup = new BackupService(log, backupRoot, _ => 0);
+
+        var firstRun = backup.CreateSqliteSpacePlan(database, includeVacuum: true);
+        Assert.IsTrue(firstRun.IsSameVolume);
+        Assert.AreEqual(1000, firstRun.BackupBytes);
+        Assert.AreEqual(2000, firstRun.VacuumWorkingBytes);
+        Assert.AreEqual(0, firstRun.ExistingBackupBytes);
+        Assert.AreEqual(1000 + 2000 + firstRun.SafetyMarginBytes, firstRun.SourceRequirement.RequiredBytes);
+        Assert.AreEqual(firstRun.SourceRequirement.RequiredBytes, firstRun.BackupRequirement.RequiredBytes);
+
+        var rollingFolder = backup.GetSqliteRollingFolderPath(database);
+        Directory.CreateDirectory(rollingFolder);
+        File.WriteAllText(Path.Combine(rollingFolder, BackupService.CurrentFileName), new string('c', 400));
+        var withExisting = backup.CreateSqliteSpacePlan(database, includeVacuum: true);
+        Assert.AreEqual(400, withExisting.ExistingBackupBytes);
+        var peakAfterReplacement = Math.Max(1000, 1000 - 400 + 2000);
+        Assert.AreEqual(peakAfterReplacement + withExisting.SafetyMarginBytes, withExisting.SourceRequirement.RequiredBytes);
+
+        var deleteOnly = backup.CreateSqliteSpacePlan(database, includeVacuum: false);
+        Assert.AreEqual(0, deleteOnly.VacuumWorkingBytes);
+        Assert.AreEqual(1000 + deleteOnly.SafetyMarginBytes, deleteOnly.BackupRequirement.RequiredBytes);
+        Assert.AreEqual(deleteOnly.BackupRequirement.RequiredBytes, deleteOnly.SourceRequirement.RequiredBytes);
+    }
+
+    [TestMethod]
+    public void Backup_SpacePlanFailsClosedWhenVolumeUnknown()
+    {
+        using var temp = new TemporaryDirectory();
+        var log = new LogService(Path.Combine(temp.Path, "logs"));
+        var database = Path.Combine(temp.Path, "state.vscdb");
+        File.WriteAllText(database, "data");
+        var backup = new BackupService(
+            log,
+            Path.Combine(temp.Path, "backups"),
+            availableSpace: null,
+            volumeService: new FailingVolumeService());
+
+        Assert.ThrowsException<IOException>(() => backup.CreateSqliteSpacePlan(database, includeVacuum: true));
+    }
+
+    [TestMethod]
+    public void Backup_StaleStagingCleanupOnlyTouchesWhitelistedFiles()
+    {
+        using var temp = new TemporaryDirectory();
+        var log = new LogService(Path.Combine(temp.Path, "logs"));
+        var backupRoot = Path.Combine(temp.Path, "backups");
+        var database = Path.Combine(temp.Path, "state.vscdb");
+        File.WriteAllText(database, "data");
+        var backup = new BackupService(log, backupRoot, _ => 0);
+
+        var plan = backup.CreateSqliteSpacePlan(database, includeVacuum: false);
+        var folder = backup.GetSqliteRollingFolderPath(database);
+        Directory.CreateDirectory(folder);
+        var old = File.GetLastWriteTimeUtc(Path.Combine(folder, BackupService.CurrentFileName));
+        var staleStaging = Path.Combine(folder, $"{BackupService.StagingFilePrefix}deadbeef{BackupService.StagingFileExtension}");
+        File.WriteAllText(staleStaging, "stale");
+        File.WriteAllText(staleStaging + "-wal", "wal");
+        File.SetLastWriteTimeUtc(staleStaging, old.AddDays(-2));
+        File.SetLastWriteTimeUtc(staleStaging + "-wal", old.AddDays(-2));
+        File.WriteAllText(Path.Combine(folder, "unknown.txt"), "keep me");
+        File.SetLastWriteTimeUtc(Path.Combine(folder, "unknown.txt"), old.AddDays(-2));
+
+        backup.CreateSqliteSpacePlan(database, includeVacuum: false);
+
+        Assert.IsFalse(File.Exists(staleStaging));
+        Assert.IsFalse(File.Exists(staleStaging + "-wal"));
+        Assert.IsTrue(File.Exists(Path.Combine(folder, "unknown.txt")));
+    }
+
+    [TestMethod]
     public async Task Backup_WritesValidManifestAndCopiesRelativePath()
     {
         using var temp = new TemporaryDirectory();
@@ -466,6 +543,16 @@ public sealed class OperationServiceTests
         }
     }
 
+    private sealed class FailingVolumeService : IVolumeService
+    {
+        public bool TryGetVolume(string path, out VolumeInfo? volume, out string? error)
+        {
+            volume = null;
+            error = "injected volume failure";
+            return false;
+        }
+    }
+
     private sealed class FakeBackupService : IBackupService
     {
         public int Calls { get; private set; }
@@ -492,6 +579,15 @@ public sealed class OperationServiceTests
             throw new NotSupportedException();
 
         public Task<string> CommitSqliteBackupAsync(string stagingPath, CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+
+        public SqliteSpacePlan CreateSqliteSpacePlan(string databasePath, bool includeVacuum) =>
+            throw new NotSupportedException();
+
+        public SqliteSpaceFailure? CheckSqliteSpace(SqliteSpacePlan plan, SqliteSpaceFailureStage stage, bool backupWasKept = false) =>
+            throw new NotSupportedException();
+
+        public SqliteSpaceFailure? CheckVacuumSpace(string databasePath, bool backupWasKept = true) =>
             throw new NotSupportedException();
 
         public void EnsureVolumeFreeSpace(string pathOnVolume, long requiredBytes, string operationLabel) { }

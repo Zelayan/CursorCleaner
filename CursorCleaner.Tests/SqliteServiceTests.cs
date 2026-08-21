@@ -282,9 +282,61 @@ public sealed class SqliteServiceTests
         var result = await service.VacuumAsync(database, [root]);
 
         Assert.IsFalse(result.Succeeded);
-        StringAssert.Contains(result.Error!, "database volume");
+        StringAssert.Contains(result.Error!, "空间不足");
+        Assert.IsNotNull(result.SpaceFailure);
+        Assert.AreEqual(SqliteSpaceFailureStage.InitialCheck, result.SpaceFailure!.Stage);
+        Assert.IsFalse(result.SpaceFailure.BackupWasKept);
         Assert.IsNull(result.BackupPath);
         CollectionAssert.AreEqual(original, await File.ReadAllBytesAsync(database));
+    }
+
+    [TestMethod]
+    public async Task Vacuum_SpaceDropsAfterBackupKeepsVerifiedBackupAndSkipsVacuum()
+    {
+        using var temp = new TemporaryDirectory();
+        var root = Path.Combine(temp.Path, "approved");
+        Directory.CreateDirectory(root);
+        var database = Path.Combine(root, "test.db");
+        await CreateDatabaseAsync(database);
+        var original = await File.ReadAllBytesAsync(database);
+        var log = new LogService(Path.Combine(temp.Path, "logs"));
+        var backupRoot = Path.Combine(temp.Path, "backups");
+        var sqliteRoot = Path.Combine(backupRoot, BackupService.SqliteFolderName);
+        var simulateDropAfterBackup = true;
+        var backup = new BackupService(log, backupRoot, _ =>
+        {
+            if (!simulateDropAfterBackup)
+            {
+                return long.MaxValue;
+            }
+
+            var currentExists = Directory.Exists(sqliteRoot)
+                && Directory.EnumerateFiles(sqliteRoot, BackupService.CurrentFileName, SearchOption.AllDirectories).Any();
+            return currentExists ? 0 : long.MaxValue;
+        });
+        var service = new SqliteService(
+            new NeverRunningProcessService(),
+            new PathGuard([root]),
+            backup,
+            log);
+
+        var result = await service.VacuumAsync(database, [root]);
+
+        Assert.IsFalse(result.Succeeded);
+        Assert.IsNotNull(result.SpaceFailure);
+        Assert.AreEqual(SqliteSpaceFailureStage.BeforeVacuum, result.SpaceFailure!.Stage);
+        Assert.IsTrue(result.SpaceFailure.BackupWasKept);
+        StringAssert.Contains(result.Error!, "已保留");
+        Assert.IsNotNull(result.BackupPath);
+        Assert.AreEqual(BackupService.CurrentFileName, Path.GetFileName(result.BackupPath));
+        Assert.IsTrue(File.Exists(result.BackupPath));
+        CollectionAssert.AreEqual(original, await File.ReadAllBytesAsync(database));
+        await AssertQuickCheckAsync(database);
+
+        Volatile.Write(ref simulateDropAfterBackup, false);
+        var retry = await service.VacuumAsync(database, [root]);
+
+        Assert.IsTrue(retry.Succeeded, retry.Error);
     }
 
     [TestMethod]
@@ -385,7 +437,33 @@ public sealed class SqliteServiceTests
         var result = await service.DeleteChatRecordsAsync([SqliteChatFixtures.KeepId], [database], [root]);
 
         Assert.IsFalse(result.Succeeded);
-        StringAssert.Contains(result.Error!, "Insufficient free space");
+        StringAssert.Contains(result.Error!, "空间不足");
+        Assert.IsNull(result.Databases[0].BackupPath);
+        CollectionAssert.AreEqual(original, await File.ReadAllBytesAsync(database));
+    }
+
+    [TestMethod]
+    public async Task DeleteChatRecords_NoMatchSkipsSpaceWrites()
+    {
+        using var temp = new TemporaryDirectory();
+        var root = Path.Combine(temp.Path, "approved");
+        Directory.CreateDirectory(root);
+        var database = Path.Combine(root, "state.vscdb");
+        await SqliteChatFixtures.CreateStateDatabaseAsync(database);
+        var original = await File.ReadAllBytesAsync(database);
+        var log = new LogService(Path.Combine(temp.Path, "logs"));
+        var service = new SqliteService(
+            new NeverRunningProcessService(),
+            new PathGuard([root]),
+            new BackupService(log, Path.Combine(temp.Path, "backups"), _ => 0),
+            log);
+
+        var result = await service.DeleteChatRecordsAsync(
+            ["aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"],
+            [database],
+            [root]);
+
+        Assert.IsTrue(result.Succeeded, result.Error);
         Assert.IsNull(result.Databases[0].BackupPath);
         CollectionAssert.AreEqual(original, await File.ReadAllBytesAsync(database));
     }

@@ -489,6 +489,24 @@
                   </StackPanel>
                 </Grid>
               </Border>
+              <Border Classes="card" Margin="0,0,0,10">
+                <Grid>
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="180"/>
+                    <ColumnDefinition Width="*"/>
+                  </Grid.ColumnDefinitions>
+                  <TextBlock Text="备份目录" Classes="sectionHeader"/>
+                  <StackPanel Grid.Column="1" Spacing="6">
+                    <TextBlock Text="{Binding BackupDirectoryHint}" Classes="muted" TextWrapping="Wrap"/>
+                    <TextBlock Text="SQLite 备份和文件备份都写入该目录。大数据库建议选择与 Cursor 数据不同的磁盘，可显著降低维护所需峰值空间。修改保存后下次启动生效，旧目录不会被移动或删除。"
+                               Classes="muted" TextWrapping="Wrap"/>
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                      <Button Content="选择目录…" Command="{Binding ChooseBackupDirectoryCommand}"/>
+                      <Button Content="恢复默认" Command="{Binding ResetBackupDirectoryCommand}"/>
+                    </StackPanel>
+                  </StackPanel>
+                </Grid>
+              </Border>
               <Border Classes="card">
                 <Grid>
                   <Grid.ColumnDefinitions>

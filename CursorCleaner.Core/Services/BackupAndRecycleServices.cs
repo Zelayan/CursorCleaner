@@ -23,15 +23,19 @@ public sealed class BackupService : IBackupService
     private readonly string _backupBasePath;
     private readonly ILogService _log;
     private readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web) { WriteIndented = true };
-    private readonly Func<string, long?> _availableSpace;
+    private readonly Func<string, long?>? _availableSpaceOverride;
+    private readonly IVolumeService _volumeService;
 
-    public BackupService(ILogService log, string? backupBasePath = null, Func<string, long?>? availableSpace = null)
+    public BackupService(
+        ILogService log,
+        string? backupBasePath = null,
+        Func<string, long?>? availableSpace = null,
+        IVolumeService? volumeService = null)
     {
         _log = log;
-        _backupBasePath = Path.GetFullPath(backupBasePath ?? Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            "CursorCleanerBackup"));
-        _availableSpace = availableSpace ?? (path => TryGetAvailableSpace(path, out var available) ? available : null);
+        _backupBasePath = Path.GetFullPath(backupBasePath ?? AppStorage.DefaultBackupRoot);
+        _availableSpaceOverride = availableSpace;
+        _volumeService = volumeService ?? new VolumeService();
     }
 
     public string BackupRootPath => _backupBasePath;
@@ -50,7 +54,8 @@ public sealed class BackupService : IBackupService
         try
         {
             Directory.CreateDirectory(_backupBasePath);
-            if (TryGetAvailableSpace(_backupBasePath, out var available) && available < originalSize)
+            var available = GetAvailableSpace(_backupBasePath);
+            if (available is not null && available < originalSize)
             {
                 return new BackupOperationResult(false, null, originalSize, [], "Insufficient free space for the backup.");
             }
@@ -145,6 +150,95 @@ public sealed class BackupService : IBackupService
             succeeded ? null : "One or more files could not be backed up.");
     }
 
+    public SqliteSpacePlan CreateSqliteSpacePlan(string databasePath, bool includeVacuum)
+    {
+        var source = PathSafety.Normalize(databasePath);
+        if (!File.Exists(source))
+        {
+            throw new IOException("The database to inspect is missing.");
+        }
+
+        CleanupStaleSqliteStaging(source, TimeSpan.FromHours(24));
+        var mainBytes = new FileInfo(source).Length;
+        var backupBytes = GetCombinedSqliteSize(source);
+        var vacuumBytes = includeVacuum ? SaturatingMultiply(mainBytes, 2) : 0;
+        var current = Path.Combine(GetRollingFolder(source), CurrentFileName);
+        var existingBackupBytes = File.Exists(current) ? new FileInfo(current).Length : 0;
+        var safetyBase = Math.Max(backupBytes, vacuumBytes);
+        var safetyMargin = Math.Max(1L << 30, safetyBase / 10);
+
+        var sourceVolume = GetRequiredVolume(Path.GetDirectoryName(source) ?? source);
+        var backupVolume = GetRequiredVolume(_backupBasePath);
+        var sameVolume = string.Equals(sourceVolume.Id, backupVolume.Id, StringComparison.Ordinal);
+        long sourceRequired;
+        long backupRequired;
+        if (sameVolume)
+        {
+            var afterReplacement = SaturatingAdd(Math.Max(0, backupBytes - existingBackupBytes), vacuumBytes);
+            var peak = includeVacuum ? Math.Max(backupBytes, afterReplacement) : backupBytes;
+            sourceRequired = backupRequired = SaturatingAdd(peak, safetyMargin);
+        }
+        else
+        {
+            sourceRequired = includeVacuum ? SaturatingAdd(vacuumBytes, safetyMargin) : 0;
+            backupRequired = SaturatingAdd(backupBytes, safetyMargin);
+        }
+
+        return new SqliteSpacePlan(
+            source,
+            _backupBasePath,
+            mainBytes,
+            backupBytes,
+            vacuumBytes,
+            existingBackupBytes,
+            safetyMargin,
+            includeVacuum,
+            sameVolume,
+            new VolumeSpaceRequirement(sourceVolume, sourceRequired),
+            new VolumeSpaceRequirement(backupVolume, backupRequired));
+    }
+
+    public SqliteSpaceFailure? CheckSqliteSpace(
+        SqliteSpacePlan plan,
+        SqliteSpaceFailureStage stage,
+        bool backupWasKept = false)
+    {
+        ArgumentNullException.ThrowIfNull(plan);
+        var sourcePath = Path.GetDirectoryName(plan.DatabasePath) ?? plan.DatabasePath;
+        var source = RefreshRequirement(sourcePath, plan.SourceRequirement);
+        var backup = plan.IsSameVolume
+            ? source with { RequiredBytes = plan.BackupRequirement.RequiredBytes }
+            : RefreshRequirement(plan.BackupRootPath, plan.BackupRequirement);
+        var failed = source.HasEnoughSpace ? (backup.HasEnoughSpace ? null : backup) : source;
+        return failed is null
+            ? null
+            : new SqliteSpaceFailure(
+                stage,
+                failed.Volume.DisplayName,
+                failed.Volume.AvailableBytes,
+                failed.RequiredBytes,
+                plan.IsSameVolume,
+                backupWasKept);
+    }
+
+    public SqliteSpaceFailure? CheckVacuumSpace(string databasePath, bool backupWasKept = true)
+    {
+        var source = PathSafety.Normalize(databasePath);
+        var mainBytes = new FileInfo(source).Length;
+        var required = SaturatingAdd(SaturatingMultiply(mainBytes, 2), Math.Max(1L << 30, mainBytes / 5));
+        var volume = GetRequiredVolume(Path.GetDirectoryName(source) ?? source);
+        var refreshed = RefreshRequirement(Path.GetDirectoryName(source) ?? source, new VolumeSpaceRequirement(volume, required));
+        return refreshed.HasEnoughSpace
+            ? null
+            : new SqliteSpaceFailure(
+                SqliteSpaceFailureStage.BeforeVacuum,
+                refreshed.Volume.DisplayName,
+                refreshed.Volume.AvailableBytes,
+                refreshed.RequiredBytes,
+                false,
+                backupWasKept);
+    }
+
     public async Task<string> CreateSqliteBackupPathAsync(string databasePath, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -211,7 +305,7 @@ public sealed class BackupService : IBackupService
         }
 
         var probePath = ResolveExistingPath(PathSafety.Normalize(pathOnVolume));
-        var available = _availableSpace(probePath);
+        var available = GetAvailableSpace(probePath);
         if (available is null)
         {
             throw new IOException($"{operationLabel}; free space could not be determined.");
@@ -222,6 +316,71 @@ public sealed class BackupService : IBackupService
             throw new IOException($"{operationLabel}; {requiredBytes} bytes required.");
         }
     }
+
+    private VolumeInfo GetRequiredVolume(string path)
+    {
+        if (!_volumeService.TryGetVolume(path, out var volume, out var error) || volume is null)
+        {
+            throw new IOException($"Volume information could not be determined: {error}");
+        }
+
+        var overridden = _availableSpaceOverride?.Invoke(ResolveExistingPath(PathSafety.Normalize(path)));
+        return overridden is null ? volume : volume with { AvailableBytes = overridden.Value };
+    }
+
+    private VolumeSpaceRequirement RefreshRequirement(string path, VolumeSpaceRequirement requirement) =>
+        new(GetRequiredVolume(path), requirement.RequiredBytes);
+
+    private long? GetAvailableSpace(string path)
+    {
+        if (_availableSpaceOverride is not null)
+        {
+            return _availableSpaceOverride(ResolveExistingPath(PathSafety.Normalize(path)));
+        }
+
+        return _volumeService.TryGetVolume(path, out var volume, out _) ? volume?.AvailableBytes : null;
+    }
+
+    private void CleanupStaleSqliteStaging(string databasePath, TimeSpan minimumAge)
+    {
+        var folder = GetRollingFolder(databasePath);
+        if (!Directory.Exists(folder))
+        {
+            return;
+        }
+
+        var cutoff = DateTime.UtcNow - minimumAge;
+        foreach (var path in Directory.EnumerateFiles(folder))
+        {
+            var fileName = Path.GetFileName(path);
+            var baseName = fileName;
+            foreach (var suffix in new[] { "-wal", "-shm", "-journal" })
+            {
+                if (baseName.EndsWith(suffix, StringComparison.Ordinal))
+                {
+                    baseName = baseName[..^suffix.Length];
+                    break;
+                }
+            }
+
+            if (!IsStagingFileName(baseName) || File.GetLastWriteTimeUtc(path) > cutoff)
+            {
+                continue;
+            }
+
+            var normalized = PathSafety.Normalize(path);
+            if (PathSafety.IsWithin(normalized, folder, allowRoot: false))
+            {
+                TryDelete(normalized);
+            }
+        }
+    }
+
+    private static long SaturatingAdd(long left, long right) =>
+        left > long.MaxValue - right ? long.MaxValue : left + right;
+
+    private static long SaturatingMultiply(long value, int multiplier) =>
+        value > long.MaxValue / multiplier ? long.MaxValue : value * multiplier;
 
     private static string ResolveExistingPath(string path)
     {
@@ -340,6 +499,8 @@ public sealed class BackupService : IBackupService
             }
         }
     }
+
+    public string GetSqliteRollingFolderPath(string databasePath) => GetRollingFolder(PathSafety.Normalize(databasePath));
 
     private string GetSqliteRoot() => Path.GetFullPath(Path.Combine(_backupBasePath, SqliteFolderName));
 

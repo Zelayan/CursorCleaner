@@ -82,14 +82,13 @@ public sealed class SqliteService : ISqliteService
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
-
-            // Source volume must hold a VACUUM rewrite (~DB size). Backup volume is checked when
-            // CreateSqliteBackupPathAsync reserves staging (after the backup root exists).
-            var sourceProbe = Path.GetDirectoryName(path) ?? path;
-            _backupService.EnsureVolumeFreeSpace(
-                sourceProbe,
-                sizeBefore,
-                "Insufficient free space on the database volume for VACUUM");
+            Report(progress, SqliteProgressStage.CheckingSpace, path);
+            var spacePlan = _backupService.CreateSqliteSpacePlan(path, includeVacuum: true);
+            var initialSpaceFailure = _backupService.CheckSqliteSpace(spacePlan, SqliteSpaceFailureStage.InitialCheck);
+            if (initialSpaceFailure is not null)
+            {
+                return SpaceFailure(path, sizeBefore, null, initialSpaceFailure);
+            }
 
             await using var connection = new SqliteConnection(BuildConnectionString(path, SqliteOpenMode.ReadWrite));
             await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
@@ -124,6 +123,13 @@ public sealed class SqliteService : ISqliteService
                 return Failure(path, sizeBefore, verifiedBackupPath, "Cursor started before checkpoint; the verified backup was kept and no write was started.");
             }
 
+            Report(progress, SqliteProgressStage.CheckingSpace, path);
+            var afterBackupFailure = _backupService.CheckVacuumSpace(path);
+            if (afterBackupFailure is not null)
+            {
+                return SpaceFailure(path, sizeBefore, verifiedBackupPath, afterBackupFailure);
+            }
+
             Report(progress, SqliteProgressStage.Checkpoint, path);
             await RunCheckpointAsync(connection, cancellationToken).ConfigureAwait(false);
 
@@ -137,6 +143,13 @@ public sealed class SqliteService : ISqliteService
             if (_processService.IsCursorRunning())
             {
                 return Failure(path, sizeBefore, verifiedBackupPath, "Cursor started before VACUUM; the verified backup was kept and VACUUM was not started.");
+            }
+
+            Report(progress, SqliteProgressStage.CheckingSpace, path);
+            var beforeVacuumFailure = _backupService.CheckVacuumSpace(path);
+            if (beforeVacuumFailure is not null)
+            {
+                return SpaceFailure(path, sizeBefore, verifiedBackupPath, beforeVacuumFailure);
             }
 
             Report(progress, SqliteProgressStage.Vacuuming, path);
@@ -174,10 +187,25 @@ public sealed class SqliteService : ISqliteService
             }
 
             await TryLogAsync("error", "sqlite.maintenance", "Database maintenance failed.", path, ex).ConfigureAwait(false);
-            var classification = ex is SqliteException sqliteException && sqliteException.SqliteErrorCode == 26
-                ? "Database is damaged or is not a SQLite database"
+            var classification = ex is SqliteException sqliteException
+                ? sqliteException.SqliteErrorCode switch
+                {
+                    13 => "磁盘空间不足，SQLite 无法完成数据库维护",
+                    26 => "Database is damaged or is not a SQLite database",
+                    _ => "Database is locked or maintenance failed"
+                }
                 : "Database is locked or maintenance failed";
-            return Failure(path, sizeBefore, verifiedBackupPath, $"{classification}: {ex.Message}");
+            var spaceFailure = ex is SqliteException { SqliteErrorCode: 13 }
+                ? CreateDiskFullFailure(path, verifiedBackupPath is not null)
+                : null;
+            return new SqliteMaintenanceResult(
+                path,
+                false,
+                sizeBefore,
+                sizeBefore,
+                verifiedBackupPath,
+                $"{classification}: {ex.Message}",
+                spaceFailure);
         }
 
         if (!TryGetCombinedSize(path, out var sizeAfter, out sizeError))
@@ -363,6 +391,14 @@ public sealed class SqliteService : ISqliteService
             {
                 Report(progress, SqliteProgressStage.Completed, path, databaseIndex, databaseCount, 100);
                 return new SqliteChatDatabaseResult(path, true, 0, null, "No matching chat rows were found.");
+            }
+
+            Report(progress, SqliteProgressStage.CheckingSpace, path, databaseIndex, databaseCount);
+            var spacePlan = _backupService.CreateSqliteSpacePlan(path, includeVacuum: false);
+            var spaceFailure = _backupService.CheckSqliteSpace(spacePlan, SqliteSpaceFailureStage.BackupCheck);
+            if (spaceFailure is not null)
+            {
+                return new SqliteChatDatabaseResult(path, false, 0, null, FormatSpaceFailure(spaceFailure));
             }
 
             Report(progress, SqliteProgressStage.PreparingBackup, path, databaseIndex, databaseCount);
@@ -648,6 +684,42 @@ public sealed class SqliteService : ISqliteService
     private async Task TryLogAsync(string level, string operation, string message, string path, Exception? exception)
     {
         try { await _log.WriteAsync(level, operation, message, path, exception).ConfigureAwait(false); } catch { }
+    }
+
+    private SqliteSpaceFailure? CreateDiskFullFailure(string path, bool backupWasKept)
+    {
+        try
+        {
+            var failure = _backupService.CheckVacuumSpace(path, backupWasKept);
+            if (failure is not null)
+            {
+                return failure with { Stage = SqliteSpaceFailureStage.Vacuum };
+            }
+        }
+        catch
+        {
+        }
+
+        return new SqliteSpaceFailure(
+            SqliteSpaceFailureStage.Vacuum,
+            "数据库所在卷",
+            0,
+            0,
+            false,
+            backupWasKept);
+    }
+
+    private static SqliteMaintenanceResult SpaceFailure(
+        string path,
+        long sizeBefore,
+        string? backupPath,
+        SqliteSpaceFailure failure) =>
+        new(path, false, sizeBefore, sizeBefore, backupPath, FormatSpaceFailure(failure), failure);
+
+    private static string FormatSpaceFailure(SqliteSpaceFailure failure)
+    {
+        var backup = failure.BackupWasKept ? "；已校验的在线备份已保留，未启动 VACUUM" : string.Empty;
+        return $"卷 {failure.VolumeName} 空间不足：可用 {failure.AvailableBytes} 字节，需要 {failure.RequiredBytes} 字节，还差 {failure.MissingBytes} 字节{backup}";
     }
 
     private static SqliteMaintenanceResult Failure(string path, long sizeBefore, string? backupPath, string error) =>

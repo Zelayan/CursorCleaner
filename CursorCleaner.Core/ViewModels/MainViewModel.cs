@@ -41,6 +41,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private readonly IDialogService _dialogs;
     private readonly ISessionContentService _sessionContent;
     private readonly IThemeService _theme;
+    private readonly IFolderPickerService? _folderPicker;
     private readonly object _activityGate = new();
     private readonly HashSet<Task> _activities = [];
     private readonly CancellationTokenSource _lifetimeCancellation = new();
@@ -128,7 +129,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         ISettingsService settingsService, ICleanupPlannerService planner,
         ICleanupService cleanup, IShellService shell, ISqliteService sqlite,
         IDialogService dialogs, ISessionContentService sessionContent, IThemeService theme,
-        IBackupService backup)
+        IBackupService backup, IFolderPickerService? folderPicker = null)
     {
         _pathService = pathService;
         _scanner = scanner;
@@ -146,6 +147,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _dialogs = dialogs;
         _sessionContent = sessionContent;
         _theme = theme;
+        _folderPicker = folderPicker;
 
         NavigateCommand = new RelayCommand(p => SelectedPage = int.TryParse(p?.ToString(), out var page) ? page : 0);
         ScanCommand = new AsyncRelayCommand(token => TrackActivityAsync(() => ScanAsync(token)), () => !IsScanning && !IsBusy && !_closeRequested);
@@ -172,7 +174,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         OpenDirectoryCommand = new RelayCommand(OpenDirectory);
         OpenLogsCommand = new RelayCommand(() => TryShell(_shell.OpenLogs));
         OpenDataDirectoryCommand = new RelayCommand(() => TryShell(() => _shell.OpenDirectory(Path.GetDirectoryName(_settingsService.SettingsPath)!)));
-        OpenSqliteBackupDirectoryCommand = new RelayCommand(() => TryShell(() => _shell.OpenDirectory(_backup.BackupRootPath)), () => !_closeRequested);
+        OpenSqliteBackupDirectoryCommand = new RelayCommand(OpenSqliteBackupDirectory, () => !_closeRequested);
+        ChooseBackupDirectoryCommand = new AsyncRelayCommand(token => TrackActivityAsync(() => ChooseBackupDirectoryAsync(token)), () => CanEditTargets && !IsBusy && !IsScanning && !_closeRequested);
+        ResetBackupDirectoryCommand = new RelayCommand(ResetBackupDirectory, () => CanEditTargets && !PathSafety.PathComparer.Equals(EffectiveBackupDirectory, AppStorage.DefaultBackupRoot));
         CleanupLegacySqliteBackupsCommand = new AsyncRelayCommand(token => TrackActivityAsync(() => CleanupLegacySqliteBackupsAsync(token)), () => !IsBusy && !IsScanning && !_closeRequested);
         StopCursorCommand = new AsyncRelayCommand(token => TrackActivityAsync(() => StopCursorAsync(token)), () => CanStopCursor);
         SaveSettingsCommand = new AsyncRelayCommand(token => TrackActivityAsync(() => SaveSettingsAsync(token)), () => IsSettingsDirty && !IsBusy && !IsScanning && !_closeRequested);
@@ -212,6 +216,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public RelayCommand OpenLogsCommand { get; }
     public RelayCommand OpenDataDirectoryCommand { get; }
     public RelayCommand OpenSqliteBackupDirectoryCommand { get; }
+    public AsyncRelayCommand ChooseBackupDirectoryCommand { get; }
+    public RelayCommand ResetBackupDirectoryCommand { get; }
     public AsyncRelayCommand CleanupLegacySqliteBackupsCommand { get; }
     public AsyncRelayCommand StopCursorCommand { get; }
     public AsyncRelayCommand SaveSettingsCommand { get; }
@@ -247,6 +253,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public bool IsScopeRefreshing { get => _isScopeRefreshing; private set => SetProperty(ref _isScopeRefreshing, value); }
     public string BusyText { get => _busyText; private set => SetProperty(ref _busyText, value); }
     public bool CanEditTargets => !IsBusy;
+    public string EffectiveBackupDirectory => _settings.BackupDirectory is { Length: > 0 } configured
+        ? configured
+        : AppStorage.DefaultBackupRoot;
+    public string BackupDirectoryHint => PathSafety.PathComparer.Equals(EffectiveBackupDirectory, AppStorage.DefaultBackupRoot)
+        ? $"当前备份目录：{EffectiveBackupDirectory}"
+        : $"已选择备份目录（下次启动生效）：{EffectiveBackupDirectory}。旧目录不会被移动或删除。";
     public bool IsProgressVisible => IsScanning || IsBusy;
     public bool IsScanProgressVisible => IsScanning;
     public bool IsProgressIndeterminate => !IsScanning && ProgressPercent <= 0;
@@ -991,9 +1003,38 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         var database = SelectedDatabase;
         if (database is null) return;
         if (_process.IsCursorRunning()) { await _dialogs.ShowErrorAsync("无法维护数据库", "Cursor 正在运行，SQLite 维护被阻止。", token); return; }
+        string? spaceNotice;
+        try
+        {
+            var plan = _backup.CreateSqliteSpacePlan(database.FullPath, includeVacuum: true);
+            spaceNotice = FormatSpacePlanNotice(plan);
+            if (!plan.HasEnoughSpace)
+            {
+                SqliteStatus = $"磁盘空间不足，未开始维护。{spaceNotice}";
+                SqliteStatusSeverity = StatusSeverity.Error;
+                if (!_closeRequested)
+                {
+                    await _dialogs.ShowErrorAsync("磁盘空间不足", $"无法开始数据库维护：\n{spaceNotice}\n\n请释放空间，或在设置中选择其他磁盘作为备份目录。", token);
+                }
+
+                return;
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            SqliteStatus = $"无法评估磁盘空间：{ex.Message}";
+            SqliteStatusSeverity = StatusSeverity.Error;
+            if (!_closeRequested)
+            {
+                await _dialogs.ShowErrorAsync("无法评估磁盘空间", ex.Message, token);
+            }
+
+            return;
+        }
+
         var confirmed = await _dialogs.ConfirmAsync(
             "确认 SQLite 维护",
-            $"将对以下数据库执行完整性检查、强制备份和 VACUUM：\n{database.FullPath}\n{FormatSqliteBackupNotice([database.FullPath], includeSourceVacuumSpace: true)}\n大数据库的检查和备份可能需要很长时间，界面会显示当前阶段和备份百分比。VACUUM 开始后不可取消。操作期间请保持 Cursor 关闭。",
+            $"将对以下数据库执行完整性检查、强制备份和 VACUUM：\n{database.FullPath}\n{FormatSqliteBackupNotice([database.FullPath], includeSourceVacuumSpace: true)}\n{spaceNotice}\n大数据库的检查和备份可能需要很长时间，界面会显示当前阶段和备份百分比。VACUUM 开始后不可取消。操作期间请保持 Cursor 关闭。",
             token);
         if (!confirmed) return;
         IsBusy = true;
@@ -1022,7 +1063,21 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             {
                 SqliteStatus = $"维护失败：{result.Error}";
                 SqliteStatusSeverity = StatusSeverity.Error;
-                if (!_closeRequested) await _dialogs.ShowErrorAsync("SQLite 维护失败", result.Error ?? "未知错误", CancellationToken.None);
+                if (result.SpaceFailure is { BackupWasKept: true } spaceFailure)
+                {
+                    SqliteStatus = $"维护未完成：{result.Error}。在线备份已保留：{result.BackupPath}";
+                    if (!_closeRequested)
+                    {
+                        await _dialogs.ShowErrorAsync(
+                            "空间不足，VACUUM 未开始",
+                            $"已生成并校验在线备份，原数据库未被修改。\n卷 {spaceFailure.VolumeName} 空间不足：可用 {ByteSizeFormatter.Format(spaceFailure.AvailableBytes)}，需要 {ByteSizeFormatter.Format(spaceFailure.RequiredBytes)}，还差 {ByteSizeFormatter.Format(spaceFailure.MissingBytes)}。\n请释放空间后重试。",
+                            CancellationToken.None);
+                    }
+                }
+                else if (!_closeRequested)
+                {
+                    await _dialogs.ShowErrorAsync("SQLite 维护失败", result.Error ?? "未知错误", CancellationToken.None);
+                }
             }
         }
         catch (OperationCanceledException)
@@ -1065,6 +1120,105 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         catch (Exception ex)
         {
             await TryLogAsync("error", "ui.sqlite.rescan", ex.Message, ex);
+        }
+    }
+
+    private void OpenSqliteBackupDirectory()
+    {
+        try
+        {
+            Directory.CreateDirectory(_backup.BackupRootPath);
+        }
+        catch (Exception ex)
+        {
+            SqliteBackupUsageText = $"无法创建备份目录：{ex.Message}";
+        }
+
+        TryShell(() => _shell.OpenDirectory(_backup.BackupRootPath));
+    }
+
+    private async Task ChooseBackupDirectoryAsync(CancellationToken token)
+    {
+        if (_folderPicker is null)
+        {
+            SettingsStatus = "当前环境不支持目录选择";
+            SettingsStatusSeverity = StatusSeverity.Warning;
+            OnPropertyChanged(nameof(SettingsStatus));
+            return;
+        }
+
+        var selected = await _folderPicker.PickFolderAsync("选择备份目录", EffectiveBackupDirectory, token);
+        if (string.IsNullOrWhiteSpace(selected) || PathSafety.PathComparer.Equals(selected, EffectiveBackupDirectory))
+        {
+            return;
+        }
+
+        var validationError = ValidateBackupDirectory(selected);
+        if (validationError is not null)
+        {
+            SettingsStatus = $"备份目录无效：{validationError}";
+            SettingsStatusSeverity = StatusSeverity.Error;
+            OnPropertyChanged(nameof(SettingsStatus));
+            return;
+        }
+
+        _settings.BackupDirectory = Path.GetFullPath(selected);
+        IsSettingsDirty = true;
+        OnPropertyChanged(nameof(EffectiveBackupDirectory));
+        OnPropertyChanged(nameof(BackupDirectoryHint));
+        SettingsStatus = $"已选择新备份目录，保存后下次启动生效：{_settings.BackupDirectory}";
+        SettingsStatusSeverity = StatusSeverity.Warning;
+        OnPropertyChanged(nameof(SettingsStatus));
+    }
+
+    private void ResetBackupDirectory()
+    {
+        if (_settings.BackupDirectory is null)
+        {
+            return;
+        }
+
+        _settings.BackupDirectory = null;
+        IsSettingsDirty = true;
+        OnPropertyChanged(nameof(EffectiveBackupDirectory));
+        OnPropertyChanged(nameof(BackupDirectoryHint));
+        SettingsStatus = "已恢复默认备份目录，保存后下次启动生效";
+        SettingsStatusSeverity = StatusSeverity.Warning;
+        OnPropertyChanged(nameof(SettingsStatus));
+    }
+
+    private string? ValidateBackupDirectory(string candidate)
+    {
+        try
+        {
+            if (!Path.IsPathRooted(candidate))
+            {
+                return "必须是绝对路径";
+            }
+
+            var full = Path.GetFullPath(candidate);
+            if (File.Exists(full))
+            {
+                return "路径是一个文件";
+            }
+
+            foreach (var root in _pathService.GetDataRoots().Select(root => PathSafety.Normalize(root.Path)))
+            {
+                if (PathSafety.IsWithin(full, root))
+                {
+                    return "不能位于 Cursor 数据目录内";
+                }
+            }
+
+            Directory.CreateDirectory(full);
+            var probe = Path.Combine(full, $".cursorcleaner-{Guid.NewGuid():N}.tmp");
+            File.WriteAllText(probe, "probe");
+            File.Delete(probe);
+            return null;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            return ex.Message;
         }
     }
 
@@ -1139,6 +1293,27 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         {
             SqliteBackupUsageText = $"无法统计 SQLite 备份占用：{ex.Message}";
         }
+    }
+
+    private static string FormatSpacePlanNotice(SqliteSpacePlan plan)
+    {
+        var sourceVolume = plan.SourceRequirement.Volume;
+        var backupVolume = plan.BackupRequirement.Volume;
+        var backupLine = plan.IsSameVolume
+            ? $"备份卷：{backupVolume.DisplayName}（与源库同一卷）"
+            : $"备份卷：{backupVolume.DisplayName}，可用 {ByteSizeFormatter.Format(backupVolume.AvailableBytes)}，需要约 {ByteSizeFormatter.Format(plan.BackupRequirement.RequiredBytes)}";
+        var sourceLine = plan.IncludesVacuum
+            ? $"源库卷：{sourceVolume.DisplayName}，可用 {ByteSizeFormatter.Format(sourceVolume.AvailableBytes)}，需要约 {ByteSizeFormatter.Format(plan.SourceRequirement.RequiredBytes)}（含 VACUUM 重写）"
+            : $"源库卷：{sourceVolume.DisplayName}";
+        var peak = plan.IsSameVolume ? plan.SourceRequirement.RequiredBytes : 0;
+        var peakLine = plan.IsSameVolume
+            ? $"同卷预计峰值：约 {ByteSizeFormatter.Format(peak)}"
+            : "备份和 VACUUM 分别占用两个卷";
+        var missing = Math.Max(plan.SourceRequirement.MissingBytes, plan.BackupRequirement.MissingBytes);
+        var missingLine = plan.HasEnoughSpace
+            ? "当前空闲空间满足维护需求"
+            : $"空间不足，还差约 {ByteSizeFormatter.Format(missing)}；可释放空间，或在设置中选择其他磁盘作为备份目录";
+        return $"{sourceLine}。{backupLine}。{peakLine}。{missingLine}。";
     }
 
     private static string FormatSqliteBackupNotice(IEnumerable<string> databasePaths, bool includeSourceVacuumSpace = false)
@@ -1218,7 +1393,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             ScanRoamingData = ScanRoamingData,
             ScanLocalData = ScanLocalData,
             ScanUserProfile = ScanUserProfile,
-            Theme = Theme
+            Theme = Theme,
+            BackupDirectory = _settings.BackupDirectory
         };
         IsBusy = true;
         BusyText = "正在保存设置";
@@ -1560,7 +1736,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     }
     private void NotifyAllSettings()
     {
-        foreach (var property in new[] { nameof(RetentionDays), nameof(UseRetention7), nameof(UseRetention30), nameof(UseRetention90), nameof(CleanupRetentionButtonText), nameof(AutomaticBackup), nameof(UseRecycleBin), nameof(ScanRoamingData), nameof(ScanLocalData), nameof(ScanUserProfile), nameof(Theme) }) OnPropertyChanged(property);
+        foreach (var property in new[] { nameof(RetentionDays), nameof(UseRetention7), nameof(UseRetention30), nameof(UseRetention90), nameof(CleanupRetentionButtonText), nameof(AutomaticBackup), nameof(UseRecycleBin), nameof(ScanRoamingData), nameof(ScanLocalData), nameof(ScanUserProfile), nameof(Theme), nameof(EffectiveBackupDirectory), nameof(BackupDirectoryHint) }) OnPropertyChanged(property);
     }
     private void RefreshCursorState()
     {
@@ -1661,7 +1837,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             {
                 ProgressPercent = percent;
             }
-            else if (update.Stage is SqliteProgressStage.Checking or SqliteProgressStage.PreparingBackup
+            else if (update.Stage is SqliteProgressStage.CheckingSpace or SqliteProgressStage.Checking or SqliteProgressStage.PreparingBackup
                 or SqliteProgressStage.VerifyingBackup or SqliteProgressStage.DeletingRows
                 or SqliteProgressStage.Checkpoint or SqliteProgressStage.Vacuuming
                 or SqliteProgressStage.VerifyingResult)

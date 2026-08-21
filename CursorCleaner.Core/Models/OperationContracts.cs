@@ -19,6 +19,7 @@ public sealed class OperationSettings
     public bool ScanLocalData { get; set; } = true;
     public bool ScanUserProfile { get; set; } = true;
     public CleanerTheme Theme { get; set; } = CleanerTheme.System;
+    public string? BackupDirectory { get; set; }
 }
 
 public sealed record CleanupPlanItem(
@@ -101,7 +102,8 @@ public sealed record SqliteMaintenanceResult(
     long SizeBefore,
     long SizeAfter,
     string? BackupPath,
-    string? Error)
+    string? Error,
+    SqliteSpaceFailure? SpaceFailure = null)
 {
     public long ReclaimedBytes => Math.Max(0, SizeBefore - SizeAfter);
 }
@@ -126,6 +128,7 @@ public sealed record SqliteChatCleanupResult(
 
 public enum SqliteProgressStage
 {
+    CheckingSpace,
     Checking,
     PreparingBackup,
     BackingUp,
@@ -144,6 +147,54 @@ public sealed record SqliteProgress(
     int DatabaseCount,
     int? Percent,
     string Message);
+
+public enum SqliteSpaceFailureStage
+{
+    InitialCheck,
+    BackupCheck,
+    BeforeVacuum,
+    Vacuum
+}
+
+public sealed record VolumeInfo(
+    string Id,
+    string DisplayName,
+    long AvailableBytes);
+
+public sealed record VolumeSpaceRequirement(
+    VolumeInfo Volume,
+    long RequiredBytes)
+{
+    public long MissingBytes => Math.Max(0, RequiredBytes - Volume.AvailableBytes);
+    public bool HasEnoughSpace => MissingBytes == 0;
+}
+
+public sealed record SqliteSpacePlan(
+    string DatabasePath,
+    string BackupRootPath,
+    long MainDatabaseBytes,
+    long BackupBytes,
+    long VacuumWorkingBytes,
+    long ExistingBackupBytes,
+    long SafetyMarginBytes,
+    bool IncludesVacuum,
+    bool IsSameVolume,
+    VolumeSpaceRequirement SourceRequirement,
+    VolumeSpaceRequirement BackupRequirement)
+{
+    public bool HasEnoughSpace => SourceRequirement.HasEnoughSpace && BackupRequirement.HasEnoughSpace;
+}
+
+public sealed record SqliteSpaceFailure(
+    SqliteSpaceFailureStage Stage,
+    string VolumeName,
+    long AvailableBytes,
+    long RequiredBytes,
+    bool IsSameVolume,
+    bool BackupWasKept)
+{
+    public long MissingBytes => Math.Max(0, RequiredBytes - AvailableBytes);
+}
 
 public sealed record SqliteBackupUsage(
     string BackupRootPath,
@@ -213,12 +264,20 @@ public interface IBackupService
     Task<BackupOperationResult> BackupAsync(IEnumerable<CleanupPlanItem> items, CancellationToken cancellationToken = default);
     Task<string> CreateSqliteBackupPathAsync(string databasePath, CancellationToken cancellationToken = default);
     Task<string> CommitSqliteBackupAsync(string stagingPath, CancellationToken cancellationToken = default);
+    SqliteSpacePlan CreateSqliteSpacePlan(string databasePath, bool includeVacuum);
+    SqliteSpaceFailure? CheckSqliteSpace(SqliteSpacePlan plan, SqliteSpaceFailureStage stage, bool backupWasKept = false);
+    SqliteSpaceFailure? CheckVacuumSpace(string databasePath, bool backupWasKept = true);
     /// <summary>
     /// Fail-closed free-space check on the volume that contains <paramref name="pathOnVolume"/>.
     /// </summary>
     void EnsureVolumeFreeSpace(string pathOnVolume, long requiredBytes, string operationLabel);
     SqliteBackupUsage GetSqliteBackupUsage();
     Task<SqliteBackupCleanupResult> CleanupLegacySqliteBackupsAsync(CancellationToken cancellationToken = default);
+}
+
+public interface IVolumeService
+{
+    bool TryGetVolume(string path, out VolumeInfo? volume, out string? error);
 }
 
 public interface IRecycleBinService
@@ -242,6 +301,11 @@ public interface IDialogService
 {
     Task<bool> ConfirmAsync(string title, string message, CancellationToken cancellationToken = default);
     Task ShowErrorAsync(string title, string message, CancellationToken cancellationToken = default);
+}
+
+public interface IFolderPickerService
+{
+    Task<string?> PickFolderAsync(string title, string? suggestedPath = null, CancellationToken cancellationToken = default);
 }
 
 public interface ISqliteService
