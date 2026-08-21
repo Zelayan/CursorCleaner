@@ -379,8 +379,8 @@
                           IsEnabled="{Binding IsRetentionPolicy}"/>
                 <RadioButton Content="按截止日期" IsChecked="{Binding IsCutoffPolicy, Mode=TwoWay}" GroupName="CleanupPolicy"/>
                 <DatePicker Margin="22,4,0,0" HorizontalAlignment="Left" Width="200"
-                            SelectedDate="{Binding CustomCutoff, Mode=TwoWay, Converter={StaticResource DateTimeOffsetConverter}}"
-                            IsEnabled="{Binding IsCutoffPolicy}"/>
+                            IsVisible="{Binding IsCutoffPolicy}"
+                            SelectedDate="{Binding CustomCutoff, Mode=TwoWay, Converter={StaticResource DateTimeOffsetConverter}}"/>
               </StackPanel>
               <StackPanel Grid.Column="2">
                 <TextBlock Text="{Binding PreviewStatus}" TextWrapping="Wrap"/>

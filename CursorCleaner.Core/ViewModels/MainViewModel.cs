@@ -613,6 +613,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
         ResetSessionPreview("扫描结果已更新，请重新选择会话预览内容");
         RefreshStaleCleanupSummary();
+        if (updateStore && SelectedPage == 3)
+        {
+            GeneratePreview(null);
+        }
+        else
+        {
+            InvalidatePreview("扫描结果已更新，请重新生成预览");
+        }
+
         RaiseCommands();
     }
 
