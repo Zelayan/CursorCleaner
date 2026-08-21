@@ -1147,30 +1147,68 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private static string FormatSqliteBackupNotice(IEnumerable<string> databasePaths, bool includeSourceVacuumSpace = false)
     {
-        var sizes = databasePaths
+        var uniquePaths = databasePaths
             .Where(path => !string.IsNullOrWhiteSpace(path))
             .Select(PathSafety.Normalize)
             .Distinct(PathSafety.PathComparer)
-            .Select(path =>
-            {
-                try
-                {
-                    var size = new[] { path, path + "-wal", path + "-shm" }
-                        .Where(File.Exists)
-                        .Sum(candidate => new FileInfo(candidate).Length);
-                    return $"{Path.GetFileName(path)} 约 {ByteSizeFormatter.Format(size)}";
-                }
-                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException)
-                {
-                    return $"{Path.GetFileName(path)} 大小未知";
-                }
-            })
             .ToArray();
-        var sizeLine = sizes.Length == 0 ? "数据库大小未知" : string.Join("；", sizes);
+        var sizeLine = uniquePaths.Length == 0
+            ? "数据库大小未知"
+            : includeSourceVacuumSpace
+                ? FormatSingleDatabaseSize(uniquePaths[0])
+                : FormatSqliteBackupSizeSummary(uniquePaths);
         var spaceLine = includeSourceVacuumSpace
             ? "请确保备份目录所在卷至少有等量空闲空间，且源库所在卷再预留约等量空间供 VACUUM 重写。"
             : "请确保备份目录所在卷至少有等量空闲空间。";
         return $"数据库会先做在线备份（不受文件备份开关影响，同一库只保留最新一份）。{sizeLine}。{spaceLine}";
+    }
+
+    private static string FormatSqliteBackupSizeSummary(IReadOnlyList<string> uniquePaths)
+    {
+        var groups = uniquePaths
+            .GroupBy(path => Path.GetFileName(path), StringComparer.OrdinalIgnoreCase)
+            .OrderBy(group => group.Key, StringComparer.OrdinalIgnoreCase)
+            .Select(group =>
+            {
+                var measured = group.Select(TryGetSqliteDatabaseBytes).ToArray();
+                var known = measured.Where(size => size >= 0).ToArray();
+                var unknown = measured.Length - known.Length;
+                var parts = new List<string> { $"{group.Count():N0} 个 {group.Key}" };
+                if (known.Length > 0)
+                {
+                    parts.Add($"合计 {ByteSizeFormatter.Format(known.Sum())}");
+                }
+                if (unknown > 0)
+                {
+                    parts.Add($"{unknown:N0} 个大小未知");
+                }
+
+                return string.Join("，", parts);
+            })
+            .ToArray();
+        return $"共 {uniquePaths.Count:N0} 个聊天数据库：{string.Join("；", groups)}";
+    }
+
+    private static string FormatSingleDatabaseSize(string path)
+    {
+        var size = TryGetSqliteDatabaseBytes(path);
+        return size < 0
+            ? $"{Path.GetFileName(path)} 大小未知"
+            : $"{Path.GetFileName(path)} 约 {ByteSizeFormatter.Format(size)}";
+    }
+
+    private static long TryGetSqliteDatabaseBytes(string path)
+    {
+        try
+        {
+            return new[] { path, path + "-wal", path + "-shm" }
+                .Where(File.Exists)
+                .Sum(candidate => new FileInfo(candidate).Length);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException)
+        {
+            return -1;
+        }
     }
 
     private async Task SaveSettingsAsync(CancellationToken token)

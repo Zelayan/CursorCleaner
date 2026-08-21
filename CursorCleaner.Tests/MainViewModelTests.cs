@@ -281,6 +281,65 @@ public sealed class MainViewModelTests
     }
 
     [TestMethod]
+    public async Task CleanupStaleSessions_SqliteNoticeSummarizesManyDatabases()
+    {
+        await RunStaAsync(async () =>
+        {
+            using var temp = new TemporaryDirectory();
+            var rootPath = Path.Combine(temp.Path, "Cursor");
+            Directory.CreateDirectory(rootPath);
+            var root = new CursorDataRoot(rootPath, RootKind.RoamingData, "test");
+            var sessionPath = Path.Combine(rootPath, "old.json");
+            await File.WriteAllTextAsync(sessionPath, "session");
+            File.SetLastWriteTimeUtc(sessionPath, DateTime.UtcNow.AddDays(-40));
+            var databases = new List<ScanItem>();
+            for (var index = 0; index < 8; index++)
+            {
+                var relative = Path.Combine("workspaceStorage", $"w{index}", "state.vscdb");
+                var fullPath = Path.Combine(rootPath, relative);
+                Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
+                await File.WriteAllTextAsync(fullPath, new string('d', 40 + index));
+                databases.Add(Item(root, relative.Replace('\\', '/'), DataCategory.SQLite, DateTime.UtcNow.AddDays(-40)));
+            }
+
+            var searchPath = Path.Combine(rootPath, "conversation-search.db");
+            await File.WriteAllTextAsync(searchPath, "search");
+            databases.Add(Item(root, "conversation-search.db", DataCategory.SQLite, DateTime.UtcNow.AddDays(-40)));
+            var sessionItem = Item(root, "old.json", DataCategory.ChatSession, DateTime.UtcNow.AddDays(-40));
+            var session = new SessionInfo(
+                "488ef4de-7b32-4b7c-b7be-6b67203f8717",
+                sessionItem.FullPath,
+                "旧会话",
+                "p",
+                DataCategory.ChatSession,
+                10,
+                DateTime.UtcNow.AddDays(-40),
+                SessionSource.Both,
+                databases[0].FullPath,
+                ["488ef4de-7b32-4b7c-b7be-6b67203f8717"]);
+            var dialogs = new FixedDialogService(false);
+            var items = new[] { sessionItem }.Concat(databases).ToArray();
+            using var viewModel = CreateViewModel(
+                new FixedScanner(Result(items)),
+                new ScanResultStore(),
+                new FixedWorkspaceAnalyzer([]),
+                new FixedSessionAnalyzer([session]),
+                cleanup: new RecordingCleanupService(),
+                dialogs: dialogs,
+                pathService: new FixedPathService(root));
+
+            await viewModel.ScanForTestingAsync();
+            await viewModel.CleanupStaleSessionsCommand.ExecuteAsync();
+
+            StringAssert.Contains(dialogs.LastMessage!, "9 个聊天数据库");
+            StringAssert.Contains(dialogs.LastMessage!, "8 个 state.vscdb");
+            StringAssert.Contains(dialogs.LastMessage!, "1 个 conversation-search.db");
+            Assert.IsFalse(dialogs.LastMessage!.Contains("state.vscdb 约", StringComparison.Ordinal));
+            Assert.IsTrue(dialogs.LastMessage!.Split("state.vscdb", StringSplitOptions.None).Length <= 3);
+        });
+    }
+
+    [TestMethod]
     public async Task EmptyPreview_DoesNotEnableCleanup_AndSettingsBecomeDirty()
     {
         await RunStaAsync(async () =>
@@ -527,6 +586,9 @@ public sealed class MainViewModelTests
             StringAssert.Contains(dialogs.LastMessage!, "SQLite");
             StringAssert.Contains(dialogs.LastMessage!, "只保留最新一份");
             StringAssert.Contains(dialogs.LastMessage!, "不会立刻变小");
+            StringAssert.Contains(dialogs.LastMessage!, "1 个聊天数据库");
+            StringAssert.Contains(dialogs.LastMessage!, "1 个 state.vscdb");
+            Assert.IsFalse(dialogs.LastMessage!.Contains("state.vscdb 约", StringComparison.Ordinal));
             StringAssert.Contains(dialogs.LastMessage!, "优化数据库");
             Assert.IsFalse(dialogs.LastMessage!.Contains("预计立即释放 0.0 B", StringComparison.Ordinal));
             StringAssert.Contains(viewModel.OperationStatus, "优化数据库");
