@@ -196,6 +196,25 @@ public sealed record SqliteSpaceFailure(
     public long MissingBytes => Math.Max(0, RequiredBytes - AvailableBytes);
 }
 
+public sealed record SqliteUsageEntry(string Name, long RowCount, long TotalBytes);
+
+public sealed record SqliteUsageReport(
+    string DatabasePath,
+    long FileBytes,
+    long WalBytes,
+    long LogicalBytes,
+    long FreePagesBytes,
+    bool IsChatStore,
+    int ConversationCount,
+    long ChatBytes,
+    IReadOnlyList<SqliteUsageEntry> Tables,
+    IReadOnlyList<SqliteUsageEntry> KeyPrefixes,
+    IReadOnlyList<SqliteUsageEntry> TopItemTableKeys,
+    string? Error)
+{
+    public bool Succeeded => Error is null;
+}
+
 public sealed record SqliteBackupUsage(
     string BackupRootPath,
     long RollingBytes,
@@ -321,6 +340,11 @@ public interface ISqliteService
         IEnumerable<string> databasePaths,
         IEnumerable<string> approvedRoots,
         IProgress<SqliteProgress>? progress = null,
+        CancellationToken cancellationToken = default);
+
+    Task<SqliteUsageReport> AnalyzeUsageAsync(
+        string databasePath,
+        IEnumerable<string> approvedRoots,
         CancellationToken cancellationToken = default);
 }
 

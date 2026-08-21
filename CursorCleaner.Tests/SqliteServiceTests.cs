@@ -492,6 +492,90 @@ public sealed class SqliteServiceTests
         CollectionAssert.AreEqual(original, await File.ReadAllBytesAsync(database));
     }
 
+    [TestMethod]
+    public async Task AnalyzeUsage_ChatDatabaseReportsPrefixesAndChatBytes()
+    {
+        using var temp = new TemporaryDirectory();
+        var root = Path.Combine(temp.Path, "approved");
+        Directory.CreateDirectory(root);
+        var database = Path.Combine(root, "state.vscdb");
+        await SqliteChatFixtures.CreateStateDatabaseAsync(database);
+        var original = await File.ReadAllBytesAsync(database);
+        var service = CreateService(temp.Path);
+
+        var report = await service.AnalyzeUsageAsync(database, [root]);
+
+        Assert.IsTrue(report.Succeeded, report.Error);
+        Assert.IsTrue(report.IsChatStore);
+        Assert.AreEqual(2, report.ConversationCount);
+        Assert.IsTrue(report.ChatBytes > 0);
+        Assert.IsTrue(report.FileBytes > 0);
+        Assert.IsTrue(report.LogicalBytes >= 0);
+        Assert.IsTrue(report.FreePagesBytes >= 0);
+        CollectionAssert.Contains(report.Tables.Select(item => item.Name).ToArray(), "cursorDiskKV");
+        CollectionAssert.Contains(report.KeyPrefixes.Select(item => item.Name).ToArray(), "bubbleId");
+        CollectionAssert.Contains(report.KeyPrefixes.Select(item => item.Name).ToArray(), "checkpointId");
+        CollectionAssert.Contains(report.TopItemTableKeys.Select(item => item.Name).ToArray(), "composer.composerData");
+        CollectionAssert.AreEqual(original, await File.ReadAllBytesAsync(database));
+    }
+
+    [TestMethod]
+    public async Task AnalyzeUsage_UnknownSchemaIsNotChatStore()
+    {
+        using var temp = new TemporaryDirectory();
+        var root = Path.Combine(temp.Path, "approved");
+        Directory.CreateDirectory(root);
+        var database = Path.Combine(root, "unknown.db");
+        await SqliteChatFixtures.CreateUnknownSchemaAsync(database);
+        var original = await File.ReadAllBytesAsync(database);
+        var service = CreateService(temp.Path);
+
+        var report = await service.AnalyzeUsageAsync(database, [root]);
+
+        Assert.IsTrue(report.Succeeded, report.Error);
+        Assert.IsFalse(report.IsChatStore);
+        Assert.AreEqual(0, report.ConversationCount);
+        Assert.AreEqual(0, report.ChatBytes);
+        CollectionAssert.Contains(report.Tables.Select(item => item.Name).ToArray(), "widgets");
+        Assert.AreEqual(0, report.KeyPrefixes.Count);
+        CollectionAssert.AreEqual(original, await File.ReadAllBytesAsync(database));
+    }
+
+    [TestMethod]
+    public async Task AnalyzeUsage_OutsideApprovedRootReturnsError()
+    {
+        using var temp = new TemporaryDirectory();
+        var approved = Path.Combine(temp.Path, "approved");
+        Directory.CreateDirectory(approved);
+        var database = Path.Combine(temp.Path, "outside.db");
+        await CreateDatabaseAsync(database);
+        var service = CreateService(temp.Path);
+
+        var report = await service.AnalyzeUsageAsync(database, [approved]);
+
+        Assert.IsFalse(report.Succeeded);
+        StringAssert.Contains(report.Error!, "outside");
+        Assert.AreEqual(0, report.Tables.Count);
+    }
+
+    [TestMethod]
+    public async Task AnalyzeUsage_CancelledTokenDoesNotWrite()
+    {
+        using var temp = new TemporaryDirectory();
+        var root = Path.Combine(temp.Path, "approved");
+        Directory.CreateDirectory(root);
+        var database = Path.Combine(root, "state.vscdb");
+        await SqliteChatFixtures.CreateStateDatabaseAsync(database);
+        var original = await File.ReadAllBytesAsync(database);
+        var service = CreateService(temp.Path);
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        await Assert.ThrowsExceptionAsync<OperationCanceledException>(() =>
+            service.AnalyzeUsageAsync(database, [root], cancellation.Token));
+        CollectionAssert.AreEqual(original, await File.ReadAllBytesAsync(database));
+    }
+
     private static SqliteService CreateService(string tempPath, string? trustedRoot = null)
     {
         var log = new LogService(Path.Combine(tempPath, "logs"));

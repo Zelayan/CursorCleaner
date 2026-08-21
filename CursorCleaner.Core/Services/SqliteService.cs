@@ -11,6 +11,13 @@ namespace CursorCleaner.Services;
 public sealed class SqliteService : ISqliteService
 {
     private static readonly ConcurrentDictionary<string, SemaphoreSlim> DatabaseLocks = new(StringComparer.Ordinal);
+    private static readonly HashSet<string> ChatKeyPrefixes = new(StringComparer.Ordinal)
+    {
+        "composerData",
+        "bubbleId",
+        "checkpointId",
+        "composerChat"
+    };
 
     private readonly IProcessService _processService;
     private readonly IPathGuard _pathGuard;
@@ -458,6 +465,317 @@ public sealed class SqliteService : ISqliteService
                 : "Database is locked or chat deletion failed";
             return new SqliteChatDatabaseResult(path, false, 0, verifiedBackupPath, $"{classification}: {ex.Message}");
         }
+    }
+
+    public async Task<SqliteUsageReport> AnalyzeUsageAsync(
+        string databasePath,
+        IEnumerable<string> approvedRoots,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(approvedRoots);
+        var roots = approvedRoots.Select(PathSafety.Normalize).Distinct(PathSafety.PathComparer).ToArray();
+        var guard = _pathGuard.ValidateSqliteTarget(databasePath, roots);
+        if (!guard.IsSafe)
+        {
+            return new SqliteUsageReport(databasePath, 0, 0, 0, 0, false, 0, 0, [], [], [], guard.Error ?? "Database path validation failed.");
+        }
+
+        var path = guard.NormalizedPath!;
+        try
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await using var connection = new SqliteConnection(BuildConnectionString(path, SqliteOpenMode.ReadOnly));
+            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+
+            var shape = await CursorChatSchema.DiscoverAsync(connection, cancellationToken).ConfigureAwait(false);
+            var tables = await CollectTableUsageAsync(connection, cancellationToken).ConfigureAwait(false);
+            var prefixes = shape.CursorDiskKv
+                ? await CollectKeyPrefixesAsync(connection, cancellationToken).ConfigureAwait(false)
+                : [];
+            var topKeys = shape.ItemTable
+                ? await CollectTopKeysAsync(connection, cancellationToken).ConfigureAwait(false)
+                : [];
+
+            var isChatStore = await CursorChatSchema.HasChatDataAsync(connection, shape, cancellationToken).ConfigureAwait(false);
+            var chatBytes = await CollectChatBytesAsync(connection, shape, tables, prefixes, cancellationToken).ConfigureAwait(false);
+            var conversationCount = await CountConversationsAsync(connection, shape, cancellationToken).ConfigureAwait(false);
+
+            var fileBytes = new FileInfo(path).Length;
+            var walBytes = File.Exists(path + "-wal") ? new FileInfo(path + "-wal").Length : 0;
+            var (logicalBytes, freeBytes) = await GetPageStatsAsync(connection, cancellationToken).ConfigureAwait(false);
+
+            return new SqliteUsageReport(
+                path,
+                fileBytes,
+                walBytes,
+                logicalBytes,
+                freeBytes,
+                isChatStore,
+                conversationCount,
+                chatBytes,
+                tables,
+                prefixes,
+                topKeys,
+                null);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex) when (ex is SqliteException or IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            await TryLogAsync("error", "sqlite.usage", "Database usage analysis failed.", path, ex).ConfigureAwait(false);
+            return new SqliteUsageReport(path, 0, 0, 0, 0, false, 0, 0, [], [], [], ex.Message);
+        }
+    }
+
+    private static async Task<IReadOnlyList<SqliteUsageEntry>> CollectTableUsageAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        var tableNames = new List<string>();
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name;";
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                tableNames.Add(reader.GetString(0));
+            }
+        }
+
+        var entries = new List<SqliteUsageEntry>(tableNames.Count);
+        foreach (var table in tableNames)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var columns = new List<string>();
+            await using (var info = connection.CreateCommand())
+            {
+                info.CommandText = $"PRAGMA table_info('{table.Replace("'", "''")}');";
+                await using var reader = await info.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                {
+                    var type = reader.GetString(2);
+                    if (type.Contains("TEXT", StringComparison.OrdinalIgnoreCase) ||
+                        type.Contains("CHAR", StringComparison.OrdinalIgnoreCase) ||
+                        type.Contains("BLOB", StringComparison.OrdinalIgnoreCase))
+                    {
+                        columns.Add(reader.GetString(1));
+                    }
+                }
+            }
+
+            var quotedTable = QuoteIdentifier(table);
+            long rowCount;
+            long totalBytes;
+            if (columns.Count == 0)
+            {
+                rowCount = await ScalarCountAsync(connection, $"SELECT COUNT(*) FROM {quotedTable};", cancellationToken).ConfigureAwait(false);
+                totalBytes = 0;
+            }
+            else
+            {
+                var sums = string.Join("+", columns.Take(8).Select(column => $"COALESCE(LENGTH({QuoteIdentifier(column)}), 0)"));
+                await using var stats = connection.CreateCommand();
+                stats.CommandText = $"SELECT COUNT(*), COALESCE(SUM({sums}), 0) FROM {quotedTable};";
+                await using var statsReader = await stats.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                if (!await statsReader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                {
+                    continue;
+                }
+
+                rowCount = statsReader.GetInt64(0);
+                totalBytes = statsReader.GetInt64(1);
+            }
+
+            entries.Add(new SqliteUsageEntry(table, rowCount, totalBytes));
+        }
+
+        return entries.OrderByDescending(entry => entry.TotalBytes).ThenBy(entry => entry.Name, StringComparer.Ordinal).ToArray();
+    }
+
+    private static async Task<IReadOnlyList<SqliteUsageEntry>> CollectKeyPrefixesAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT CASE
+                     WHEN key IS NULL OR key = '' THEN '(无前缀)'
+                     WHEN INSTR(key, ':') = 0 THEN key
+                     ELSE SUBSTR(key, 1, INSTR(key, ':') - 1)
+                   END AS prefix,
+                   COUNT(*) AS rows,
+                   COALESCE(SUM(LENGTH(key) + LENGTH(value)), 0) AS bytes
+            FROM cursorDiskKV
+            GROUP BY prefix
+            ORDER BY bytes DESC, prefix;
+            """;
+        var entries = new List<SqliteUsageEntry>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            entries.Add(new SqliteUsageEntry(
+                reader.IsDBNull(0) ? "(无前缀)" : reader.GetString(0),
+                reader.GetInt64(1),
+                reader.GetInt64(2)));
+        }
+
+        return entries;
+    }
+
+    private static async Task<IReadOnlyList<SqliteUsageEntry>> CollectTopKeysAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT key, COALESCE(LENGTH(value), 0)
+            FROM ItemTable
+            WHERE key IS NOT NULL
+            ORDER BY LENGTH(value) DESC, key
+            LIMIT 10;
+            """;
+        var entries = new List<SqliteUsageEntry>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            entries.Add(new SqliteUsageEntry(reader.GetString(0), 1, reader.GetInt64(1)));
+        }
+
+        return entries;
+    }
+
+    private static async Task<long> CollectChatBytesAsync(
+        SqliteConnection connection,
+        CursorChatSchema.DatabaseShape shape,
+        IReadOnlyList<SqliteUsageEntry> tables,
+        IReadOnlyList<SqliteUsageEntry> prefixes,
+        CancellationToken cancellationToken)
+    {
+        var chatBytes = tables.Where(table => table.Name is "composerHeaders" or "conversations").Sum(table => table.TotalBytes)
+            + prefixes.Where(prefix => ChatKeyPrefixes.Contains(prefix.Name)).Sum(prefix => prefix.TotalBytes);
+
+        if (shape.ItemTable)
+        {
+            chatBytes += await ScalarCountAsync(
+                connection,
+                """
+                SELECT COALESCE(SUM(LENGTH(key) + LENGTH(value)), 0)
+                FROM ItemTable
+                WHERE key = 'composer.composerData'
+                   OR key LIKE 'composerData:%'
+                   OR key LIKE 'bubbleId:%'
+                   OR key LIKE 'checkpointId:%'
+                   OR key LIKE 'composerChat:%';
+                """,
+                cancellationToken).ConfigureAwait(false);
+        }
+
+        return chatBytes;
+    }
+
+    private static async Task<int> CountConversationsAsync(
+        SqliteConnection connection,
+        CursorChatSchema.DatabaseShape shape,
+        CancellationToken cancellationToken)
+    {
+        var ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (shape.ComposerHeaders)
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT composerId FROM composerHeaders;";
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                AddConversationId(ids, reader.IsDBNull(0) ? null : reader.GetString(0));
+            }
+        }
+
+        if (shape.Conversations)
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT id FROM conversations;";
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                AddConversationId(ids, reader.IsDBNull(0) ? null : reader.GetString(0));
+            }
+        }
+
+        if (shape.CursorDiskKv)
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT key FROM cursorDiskKV WHERE key LIKE 'composerData:%';";
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                var key = reader.IsDBNull(0) ? null : reader.GetString(0);
+                AddConversationId(ids, ExtractComposerDataId(key));
+            }
+        }
+
+        return ids.Count;
+    }
+
+    private static void AddConversationId(HashSet<string> ids, string? value)
+    {
+        if (SqliteConversationId.IsMatch(value) &&
+            !string.Equals(value, CursorChatSchema.EmptyStateDraftId, StringComparison.OrdinalIgnoreCase))
+        {
+            ids.Add(value!);
+        }
+    }
+
+    private static string? ExtractComposerDataId(string? key)
+    {
+        const string prefix = "composerData:";
+        if (string.IsNullOrEmpty(key) || !key.StartsWith(prefix, StringComparison.Ordinal))
+        {
+            return null;
+        }
+
+        var remainder = key[prefix.Length..];
+        var separator = remainder.IndexOf(':');
+        return separator < 0 ? remainder : remainder[..separator];
+    }
+
+    private static string QuoteIdentifier(string name) => "\"" + name.Replace("\"", "\"\"") + "\"";
+
+    private static async Task<(long LogicalBytes, long FreeBytes)> GetPageStatsAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = "PRAGMA page_size; PRAGMA page_count; PRAGMA freelist_count;";
+        var values = new List<long>(3);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        do
+        {
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                values.Add(reader.GetInt64(0));
+            }
+        }
+        while (await reader.NextResultAsync(cancellationToken).ConfigureAwait(false));
+
+        if (values.Count < 3 || values[0] <= 0)
+        {
+            return (0, 0);
+        }
+
+        return (values[1] * values[0], values[2] * values[0]);
+    }
+
+    private static async Task<long> ScalarCountAsync(
+        SqliteConnection connection,
+        string sql,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        return result is long value ? value : Convert.ToInt64(result ?? 0L);
     }
 
     private bool IdentityMatches(string path, FileIdentity? expected, out string? error)

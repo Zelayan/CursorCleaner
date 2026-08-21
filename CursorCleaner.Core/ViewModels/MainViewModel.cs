@@ -92,6 +92,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private string _sqliteBackupUsageText = "尚未统计 SQLite 备份占用";
     private string _sqliteBackupCleanupStatus = string.Empty;
     private StatusSeverity _sqliteBackupCleanupStatusSeverity;
+    private string _sqliteUsageReportText = "尚未分析占用";
+    private bool _hasSqliteUsageReport;
     private int _previewFiles;
     private int _previewWorkspaces;
     private int _previewSessions;
@@ -168,6 +170,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             CleanupStaleSessionsCommand.Cancel();
         }, () => IsCleaning);
         VacuumCommand = new AsyncRelayCommand(token => TrackActivityAsync(() => VacuumAsync(token)), () => SelectedDatabase is not null && !IsBusy && !IsScanning && !_closeRequested);
+        AnalyzeUsageCommand = new AsyncRelayCommand(token => TrackActivityAsync(() => AnalyzeUsageAsync(token)), () => SelectedDatabase is not null && !IsBusy && !IsScanning && !_closeRequested);
         OptimizeSuggestedDatabaseCommand = new AsyncRelayCommand(
             token => TrackActivityAsync(() => VacuumAsync(token)),
             () => SuggestDatabaseOptimize && SelectedDatabase is not null && !IsBusy && !IsScanning && !_closeRequested);
@@ -187,6 +190,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public ObservableCollection<WorkspaceInfo> Workspaces { get; } = new BulkObservableCollection<WorkspaceInfo>();
     public ObservableCollection<LargeFileInfo> LargeFiles { get; } = new BulkObservableCollection<LargeFileInfo>();
     public ObservableCollection<ScanItem> Databases { get; } = new BulkObservableCollection<ScanItem>();
+    public ObservableCollection<SqliteUsageEntry> UsageTables { get; } = new BulkObservableCollection<SqliteUsageEntry>();
+    public ObservableCollection<SqliteUsageEntry> UsagePrefixes { get; } = new BulkObservableCollection<SqliteUsageEntry>();
+    public ObservableCollection<SqliteUsageEntry> UsageTopKeys { get; } = new BulkObservableCollection<SqliteUsageEntry>();
     public ObservableCollection<string> SessionProjects { get; } = new BulkObservableCollection<string> { AllProjects };
     public ObservableCollection<SessionMessage> SessionPreviewMessages { get; } = new BulkObservableCollection<SessionMessage>();
     public IReadOnlyList<string> Categories { get; } = ["全部类型", "历史会话", "Workspace", "SQLite", "Agent Transcripts", "其他"];
@@ -211,6 +217,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public AsyncRelayCommand CleanupCommand { get; }
     public RelayCommand CancelCleanupCommand { get; }
     public AsyncRelayCommand VacuumCommand { get; }
+    public AsyncRelayCommand AnalyzeUsageCommand { get; }
     public AsyncRelayCommand OptimizeSuggestedDatabaseCommand { get; }
     public RelayCommand OpenDirectoryCommand { get; }
     public RelayCommand OpenLogsCommand { get; }
@@ -428,7 +435,13 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             {
                 SqliteStatus = value is null ? "请选择数据库" : "只读检查就绪；执行时将先备份";
                 SqliteStatusSeverity = StatusSeverity.Normal;
+                HasSqliteUsageReport = false;
+                SqliteUsageReportText = "尚未分析占用";
+                Replace(UsageTables, []);
+                Replace(UsagePrefixes, []);
+                Replace(UsageTopKeys, []);
                 VacuumCommand.NotifyCanExecuteChanged();
+                AnalyzeUsageCommand.NotifyCanExecuteChanged();
                 OptimizeSuggestedDatabaseCommand.NotifyCanExecuteChanged();
             }
         }
@@ -442,6 +455,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public string SqliteBackupUsageText { get => _sqliteBackupUsageText; private set => SetProperty(ref _sqliteBackupUsageText, value); }
     public string SqliteBackupCleanupStatus { get => _sqliteBackupCleanupStatus; private set => SetProperty(ref _sqliteBackupCleanupStatus, value); }
     public StatusSeverity SqliteBackupCleanupStatusSeverity { get => _sqliteBackupCleanupStatusSeverity; private set => SetProperty(ref _sqliteBackupCleanupStatusSeverity, value); }
+    public string SqliteUsageReportText { get => _sqliteUsageReportText; private set => SetProperty(ref _sqliteUsageReportText, value); }
+    public bool HasSqliteUsageReport { get => _hasSqliteUsageReport; private set => SetProperty(ref _hasSqliteUsageReport, value); }
 
     public bool AutomaticBackup { get => _settings.AutomaticBackup; set { if (_settings.AutomaticBackup != value) { _settings.AutomaticBackup = value; SettingsChanged(nameof(AutomaticBackup)); } } }
     public bool UseRecycleBin { get => _settings.UseRecycleBin; set { if (_settings.UseRecycleBin != value) { _settings.UseRecycleBin = value; SettingsChanged(nameof(UseRecycleBin)); } } }
@@ -1109,6 +1124,71 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             ProgressPercent = 0;
             RaiseCommands();
         }
+    }
+
+    private async Task AnalyzeUsageAsync(CancellationToken token)
+    {
+        var database = SelectedDatabase;
+        if (database is null) return;
+        IsBusy = true;
+        BusyText = $"正在分析占用：{Path.GetFileName(database.FullPath)}";
+        SqliteUsageReportText = "正在分析占用…";
+        HasSqliteUsageReport = false;
+        Replace(UsageTables, []);
+        Replace(UsagePrefixes, []);
+        Replace(UsageTopKeys, []);
+        try
+        {
+            var report = await _sqlite.AnalyzeUsageAsync(database.FullPath, GetApprovedRoots(), token);
+            if (!report.Succeeded)
+            {
+                SqliteUsageReportText = $"分析失败：{report.Error}";
+                if (!_closeRequested)
+                {
+                    await _dialogs.ShowErrorAsync("分析占用失败", report.Error ?? "未知错误", CancellationToken.None);
+                }
+
+                return;
+            }
+
+            Replace(UsageTables, report.Tables);
+            Replace(UsagePrefixes, report.KeyPrefixes);
+            Replace(UsageTopKeys, report.TopItemTableKeys);
+            HasSqliteUsageReport = true;
+            SqliteUsageReportText = FormatSqliteUsageReport(report);
+            await TryLogAsync("info", "sqlite.usage", $"Analyzed usage of {Path.GetFileName(report.DatabasePath)}: chat {report.ChatBytes} bytes, free pages {report.FreePagesBytes} bytes.");
+        }
+        catch (OperationCanceledException)
+        {
+            SqliteUsageReportText = "分析已取消";
+        }
+        catch (Exception ex)
+        {
+            SqliteUsageReportText = $"分析失败：{ex.Message}";
+            if (!_closeRequested) await ReportErrorAsync("ui.sqlite.usage", "分析占用失败", ex);
+            else await TryLogAsync("error", "ui.sqlite.usage", ex.Message, ex);
+        }
+        finally
+        {
+            IsBusy = false;
+            BusyText = string.Empty;
+            RaiseCommands();
+        }
+    }
+
+    private static string FormatSqliteUsageReport(SqliteUsageReport report)
+    {
+        var name = Path.GetFileName(report.DatabasePath);
+        var chatLine = report.IsChatStore
+            ? $"识别为聊天库，约 {report.ConversationCount:N0} 个会话，聊天记录与检查点占 {ByteSizeFormatter.Format(report.ChatBytes)}；清理旧会话后可优化回收"
+            : "未识别出聊天数据；空间主要来自状态存储，分析不会删除任何键";
+        var walLine = report.WalBytes > 0
+            ? $"，WAL {ByteSizeFormatter.Format(report.WalBytes)}"
+            : string.Empty;
+        var freeLine = report.FreePagesBytes > 0
+            ? $"空闲页 {ByteSizeFormatter.Format(report.FreePagesBytes)}，优化可立即回收"
+            : "没有明显空闲页，优化收益有限";
+        return $"{name}：文件 {ByteSizeFormatter.Format(report.FileBytes)}{walLine}，逻辑大小 {ByteSizeFormatter.Format(report.LogicalBytes)}。{chatLine}。{freeLine}。";
     }
 
     private async Task RescanAfterVacuumAsync()
@@ -1887,6 +1967,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         CleanupCommand.NotifyCanExecuteChanged();
         CancelCleanupCommand.NotifyCanExecuteChanged();
         VacuumCommand.NotifyCanExecuteChanged();
+        AnalyzeUsageCommand.NotifyCanExecuteChanged();
         OptimizeSuggestedDatabaseCommand.NotifyCanExecuteChanged();
         OpenSqliteBackupDirectoryCommand.NotifyCanExecuteChanged();
         CleanupLegacySqliteBackupsCommand.NotifyCanExecuteChanged();

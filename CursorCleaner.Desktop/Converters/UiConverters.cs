@@ -17,6 +17,15 @@ public sealed class ByteSizeConverter : IValueConverter
         Avalonia.Data.BindingOperations.DoNothing;
 }
 
+public sealed class IntFormatConverter : IValueConverter
+{
+    public object Convert(object? value, Type targetType, object? parameter, CultureInfo culture) =>
+        value is long count ? count.ToString("N0", culture) : "0";
+
+    public object ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture) =>
+        Avalonia.Data.BindingOperations.DoNothing;
+}
+
 public sealed class BooleanToVisibilityConverter : IValueConverter
 {
     public object Convert(object? value, Type targetType, object? parameter, CultureInfo culture)

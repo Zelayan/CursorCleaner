@@ -1173,6 +1173,8 @@ public sealed class MainViewModelTests
         public Task<SqliteMaintenanceResult> VacuumAsync(string databasePath, IEnumerable<string> approvedRoots, IProgress<SqliteProgress>? progress = null, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<SqliteChatCleanupResult> DeleteChatRecordsAsync(IEnumerable<string> conversationIds, IEnumerable<string> databasePaths, IEnumerable<string> approvedRoots, IProgress<SqliteProgress>? progress = null, CancellationToken cancellationToken = default) =>
             Task.FromResult(new SqliteChatCleanupResult(true, false, [], null));
+        public Task<SqliteUsageReport> AnalyzeUsageAsync(string databasePath, IEnumerable<string> approvedRoots, CancellationToken cancellationToken = default) =>
+            Task.FromResult(new SqliteUsageReport(databasePath, 0, 0, 0, 0, false, 0, 0, [], [], [], null));
     }
 
     private sealed class RecordingSqliteService : ISqliteService
@@ -1190,6 +1192,8 @@ public sealed class MainViewModelTests
             progress?.Report(new SqliteProgress(SqliteProgressStage.DeletingRows, path, 1, 1, null, DisplayText.SqliteProgressMessage(SqliteProgressStage.DeletingRows, path, 1, 1, null)));
             return Task.FromResult(new SqliteChatCleanupResult(true, false, [new SqliteChatDatabaseResult(path, true, 3, null, null)], null));
         }
+        public Task<SqliteUsageReport> AnalyzeUsageAsync(string databasePath, IEnumerable<string> approvedRoots, CancellationToken cancellationToken = default) =>
+            Task.FromResult(new SqliteUsageReport(databasePath, 0, 0, 0, 0, false, 0, 0, [], [], [], null));
     }
     private sealed class NullSessionContentService : ISessionContentService
     {
@@ -1283,8 +1287,11 @@ public sealed class MainViewModelTests
             return Task.FromResult(new SqliteChatCleanupResult(
                 false,
                 false,
-                [new SqliteChatDatabaseResult(paths.FirstOrDefault() ?? string.Empty, false, 0, null, "Injected SQLite failure.")],
+                    [new SqliteChatDatabaseResult(paths.FirstOrDefault() ?? string.Empty, false, 0, null, "Injected SQLite failure.")],
                 "Injected SQLite failure."));
         }
+
+        public Task<SqliteUsageReport> AnalyzeUsageAsync(string databasePath, IEnumerable<string> approvedRoots, CancellationToken cancellationToken = default) =>
+            Task.FromResult(new SqliteUsageReport(databasePath, 0, 0, 0, 0, false, 0, 0, [], [], [], "Injected SQLite failure."));
     }
 }

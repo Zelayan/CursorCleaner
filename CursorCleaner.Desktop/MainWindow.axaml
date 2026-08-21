@@ -421,10 +421,11 @@
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
           </Grid.RowDefinitions>
           <TextBlock Text="数据库" Classes="pageTitle"/>
           <Border Grid.Row="1" Classes="card" Margin="0,0,0,12" Background="{DynamicResource WarningBackgroundBrush}">
-            <TextBlock Text="SQLite VACUUM 会改写数据库文件。必须关闭 Cursor；执行前会强制在线备份。结构不认识或备份失败时不会写入。" TextWrapping="Wrap" Foreground="{DynamicResource WarningBrush}"/>
+            <TextBlock Text="SQLite VACUUM 会改写数据库文件。必须关闭 Cursor；执行前会强制在线备份。结构不认识或备份失败时不会写入。占用分析只读，无需关闭 Cursor，也不会删除数据。" TextWrapping="Wrap" Foreground="{DynamicResource WarningBrush}"/>
           </Border>
           <DataGrid Grid.Row="2" x:Name="DatabasesGrid" ItemsSource="{Binding Databases}" SelectedItem="{Binding SelectedDatabase, Mode=TwoWay}" AutoGenerateColumns="False" IsEnabled="{Binding CanEditTargets}">
             <DataGrid.Columns>
@@ -433,7 +434,50 @@
               <DataGridTextColumn Header="大小" Binding="{Binding Size, Converter={StaticResource ByteSizeConverter}}" Width="100"/>
             </DataGrid.Columns>
           </DataGrid>
-          <Grid Grid.Row="3" Margin="0,10,0,0">
+          <Border Grid.Row="3" Margin="0,10,0,0" Padding="14" Classes="card"
+                  Background="{DynamicResource SurfaceAltBrush}"
+                  IsVisible="{Binding HasSqliteUsageReport}">
+            <ScrollViewer MaxHeight="260" VerticalScrollBarVisibility="Auto">
+              <StackPanel>
+                <TextBlock Text="{Binding SqliteUsageReportText}" TextWrapping="Wrap"/>
+                <Grid Margin="0,10,0,0">
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="12"/>
+                    <ColumnDefinition Width="*"/>
+                  </Grid.ColumnDefinitions>
+                  <StackPanel>
+                    <TextBlock Text="表占用" Classes="sectionHeader"/>
+                    <DataGrid ItemsSource="{Binding UsageTables}" AutoGenerateColumns="False" IsReadOnly="True" HeadersVisibility="Column">
+                      <DataGrid.Columns>
+                        <DataGridTextColumn Header="表" Binding="{Binding Name}" Width="*"/>
+                        <DataGridTextColumn Header="行数" Binding="{Binding RowCount, Converter={StaticResource IntFormatConverter}}" Width="80"/>
+                        <DataGridTextColumn Header="大小" Binding="{Binding TotalBytes, Converter={StaticResource ByteSizeConverter}}" Width="90"/>
+                      </DataGrid.Columns>
+                    </DataGrid>
+                  </StackPanel>
+                  <StackPanel Grid.Column="2">
+                    <TextBlock Text="cursorDiskKV 键前缀" Classes="sectionHeader"/>
+                    <DataGrid ItemsSource="{Binding UsagePrefixes}" AutoGenerateColumns="False" IsReadOnly="True" HeadersVisibility="Column">
+                      <DataGrid.Columns>
+                        <DataGridTextColumn Header="前缀" Binding="{Binding Name}" Width="*"/>
+                        <DataGridTextColumn Header="行数" Binding="{Binding RowCount, Converter={StaticResource IntFormatConverter}}" Width="80"/>
+                        <DataGridTextColumn Header="大小" Binding="{Binding TotalBytes, Converter={StaticResource ByteSizeConverter}}" Width="90"/>
+                      </DataGrid.Columns>
+                    </DataGrid>
+                    <TextBlock Text="ItemTable 最大键" Classes="sectionHeader" Margin="0,8,0,0"/>
+                    <DataGrid ItemsSource="{Binding UsageTopKeys}" AutoGenerateColumns="False" IsReadOnly="True" HeadersVisibility="Column">
+                      <DataGrid.Columns>
+                        <DataGridTextColumn Header="键" Binding="{Binding Name}" Width="*"/>
+                        <DataGridTextColumn Header="大小" Binding="{Binding TotalBytes, Converter={StaticResource ByteSizeConverter}}" Width="90"/>
+                      </DataGrid.Columns>
+                    </DataGrid>
+                  </StackPanel>
+                </Grid>
+              </StackPanel>
+            </ScrollViewer>
+          </Border>
+          <Grid Grid.Row="4" Margin="0,10,0,0">
             <Grid.ColumnDefinitions>
               <ColumnDefinition/>
               <ColumnDefinition Width="Auto"/>
@@ -449,6 +493,7 @@
             </StackPanel>
             <StackPanel Grid.Column="1" Spacing="8" VerticalAlignment="Center">
               <Button Classes="primary" Content="检查、备份并优化" Command="{Binding VacuumCommand}"/>
+              <Button Content="分析占用" Command="{Binding AnalyzeUsageCommand}"/>
               <Button Content="打开备份目录" Command="{Binding OpenSqliteBackupDirectoryCommand}"/>
               <Button Content="删除旧时间戳备份" Command="{Binding CleanupLegacySqliteBackupsCommand}"/>
             </StackPanel>

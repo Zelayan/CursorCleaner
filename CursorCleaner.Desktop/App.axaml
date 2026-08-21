@@ -26,6 +26,7 @@
     <SolidColorBrush x:Key="SuccessBrush" Color="#FF0F6B0F"/>
 
     <conv:ByteSizeConverter x:Key="ByteSizeConverter"/>
+    <conv:IntFormatConverter x:Key="IntFormatConverter"/>
     <conv:BooleanToVisibilityConverter x:Key="BoolVisibilityConverter"/>
     <conv:PageVisibilityConverter x:Key="PageVisibilityConverter"/>
     <conv:SessionSourceConverter x:Key="SessionSourceConverter"/>
