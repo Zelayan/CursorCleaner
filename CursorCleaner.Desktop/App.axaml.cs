@@ -40,7 +40,7 @@ public partial class App : Application
             _theme = new AvaloniaThemeService(this);
             var viewModel = new MainViewModel(
                 pathService, scanner, workspaceAnalyzer, sessionAnalyzer,
-                store, process, _log, settings, planner, cleanup, shell, sqlite, dialogs, sessionContent, _theme);
+                store, process, _log, settings, planner, cleanup, shell, sqlite, dialogs, sessionContent, _theme, backup);
             desktop.MainWindow = new MainWindow(viewModel);
             desktop.ShutdownRequested += (_, e) =>
             {

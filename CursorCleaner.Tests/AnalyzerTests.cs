@@ -110,6 +110,60 @@ public sealed class AnalyzerTests
         Assert.AreEqual(SessionSource.Database, sessions[0].Source);
         Assert.AreEqual(string.Empty, sessions[0].FilePath);
         Assert.AreEqual("Greeting conversation", sessions[0].Title);
+        Assert.AreEqual(0, sessions[0].Size);
+        Assert.AreEqual("—", sessions[0].DisplaySizeText);
+    }
+
+    [TestMethod]
+    public async Task SessionAnalyzer_PrefersStateDatabasePathWhenSameComposerAppearsInSearchDb()
+    {
+        using var temp = new TemporaryDirectory();
+        var composerId = "488ef4de-7b32-4b7c-b7be-6b67203f8717";
+        var search = Path.Combine(temp.Path, "conversation-search.db");
+        var state = Path.Combine(temp.Path, "state.vscdb");
+        await SqliteChatFixtures.CreateSearchDatabaseAsync(search, keepId: composerId, extraId: "dbe365e0-620f-4277-9f42-ab778a5749d9");
+        await SqliteChatFixtures.CreateStateDatabaseAsync(state, keepId: composerId, extraId: null);
+        // Search first so a naive merge would keep the weaker path without PreferDatabasePath.
+        var result = CreateResult([
+            CreateItem(search, temp.Path, DataCategory.SQLite),
+            CreateItem(state, temp.Path, DataCategory.SQLite)
+        ]);
+
+        var sessions = await new SessionAnalyzerService().AnalyzeAsync(result);
+
+        var merged = sessions.Single(session => session.Id == composerId);
+        Assert.AreEqual(SessionSource.Database, merged.Source);
+        Assert.AreEqual(state, merged.DatabasePath);
+        CollectionAssert.AreEquivalent(new[] { state, search }, merged.AllDatabasePaths.ToArray());
+        Assert.AreEqual("Greeting conversation", merged.Title);
+        Assert.AreEqual("empty-window", merged.ProjectName);
+        Assert.AreEqual("—", merged.DisplaySizeText);
+        Assert.AreEqual(2, sessions.Count);
+    }
+
+    [TestMethod]
+    public async Task SessionAnalyzer_FallbackTitleIncludesShortIdWhenNoProject()
+    {
+        using var temp = new TemporaryDirectory();
+        var composerId = "29b8856f-d840-ef4f-362b-1103fa4e3c82";
+        var search = Path.Combine(temp.Path, "conversation-search.db");
+        await SqliteChatFixtures.CreateSearchDatabaseAsync(search, keepId: composerId, extraId: "58e2baaf-bd49-71e2-ef52-e76f27c4e8a2");
+        // Clear titles so ListComposers falls back.
+        var builder = new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder { DataSource = search, Pooling = false };
+        await using (var connection = new Microsoft.Data.Sqlite.SqliteConnection(builder.ToString()))
+        {
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = "UPDATE conversations SET title = '';";
+            await command.ExecuteNonQueryAsync();
+        }
+
+        var sessions = await new SessionAnalyzerService().AnalyzeAsync(CreateResult([CreateItem(search, temp.Path, DataCategory.SQLite)]));
+
+        var first = sessions.Single(session => session.Id == composerId);
+        StringAssert.Contains(first.Title, "Cursor session - ");
+        StringAssert.Contains(first.Title, "29b8856f");
+        Assert.AreEqual("—", first.DisplaySizeText);
     }
 
     [TestMethod]

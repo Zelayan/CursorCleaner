@@ -19,29 +19,227 @@ public sealed class ProcessService : IProcessService
         "Cursor Helper (Plugin)"
     ];
 
-    public bool IsCursorRunning()
+    private static readonly string[] CursorAppNames =
+    [
+        "Cursor",
+        "Cursor - Insiders",
+        "Cursor-Insiders"
+    ];
+
+    private static readonly TimeSpan GracefulWait = TimeSpan.FromSeconds(8);
+    private static readonly TimeSpan ForceWait = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(250);
+
+    public bool IsCursorRunning() => IsAnyCursorProcessRunning();
+
+    public async Task<StopCursorResult> StopCursorAsync(CancellationToken cancellationToken = default)
     {
+        var running = EnumerateCursorProcesses();
+        if (running.Count == 0)
+        {
+            return new StopCursorResult(true, false, 0, null);
+        }
+
+        var initialCount = running.Count;
+        DisposeAll(running);
+
+        await TryGracefulQuitAsync(cancellationToken).ConfigureAwait(false);
+        if (await WaitUntilStoppedAsync(GracefulWait, cancellationToken).ConfigureAwait(false))
+        {
+            return new StopCursorResult(true, true, initialCount, null);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        var terminated = ForceKillAll(out var killErrors);
+        if (await WaitUntilStoppedAsync(ForceWait, cancellationToken).ConfigureAwait(false))
+        {
+            return new StopCursorResult(true, true, Math.Max(terminated, 1), null);
+        }
+
+        if (!IsCursorRunning())
+        {
+            return new StopCursorResult(true, true, Math.Max(terminated, 1), null);
+        }
+
+        var error = killErrors.Count > 0
+            ? string.Join(" ", killErrors)
+            : "Cursor is still running after force stop.";
+        return new StopCursorResult(false, true, terminated, error);
+    }
+
+    private static List<Process> EnumerateCursorProcesses()
+    {
+        var result = new List<Process>();
         foreach (var processName in CursorProcessNames)
         {
             Process[] processes = [];
             try
             {
                 processes = Process.GetProcessesByName(processName);
-                if (processes.Length > 0)
-                {
-                    return true;
-                }
+                result.AddRange(processes);
+                processes = [];
+            }
+            catch (InvalidOperationException)
+            {
+                DisposeAll(processes);
+            }
+            catch (System.ComponentModel.Win32Exception)
+            {
+                DisposeAll(processes);
             }
             finally
             {
-                foreach (var process in processes)
+                DisposeAll(processes);
+            }
+        }
+
+        return result;
+    }
+
+    private static Task TryGracefulQuitAsync(CancellationToken cancellationToken)
+    {
+        if (OperatingSystem.IsMacOS())
+        {
+            foreach (var appName in CursorAppNames)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                TryQuitMacApp(appName);
+            }
+
+            return Task.CompletedTask;
+        }
+
+        if (OperatingSystem.IsWindows())
+        {
+            foreach (var processName in CursorAppNames)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                Process[] processes = [];
+                try
                 {
-                    process.Dispose();
+                    processes = Process.GetProcessesByName(processName);
+                    foreach (var process in processes)
+                    {
+                        try
+                        {
+                            if (!process.HasExited)
+                            {
+                                process.CloseMainWindow();
+                            }
+                        }
+                        catch (InvalidOperationException)
+                        {
+                        }
+                        catch (System.ComponentModel.Win32Exception)
+                        {
+                        }
+                    }
+                }
+                finally
+                {
+                    DisposeAll(processes);
                 }
             }
         }
 
-        return false;
+        return Task.CompletedTask;
+    }
+
+    private static void TryQuitMacApp(string appName)
+    {
+        try
+        {
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = "osascript",
+                UseShellExecute = false,
+                RedirectStandardError = true,
+                RedirectStandardOutput = true,
+                CreateNoWindow = true
+            };
+            startInfo.ArgumentList.Add("-e");
+            startInfo.ArgumentList.Add($"tell application \"{appName}\" to quit");
+            using var process = Process.Start(startInfo);
+            if (process is null)
+            {
+                return;
+            }
+
+            if (!process.WaitForExit(5_000))
+            {
+                try { process.Kill(entireProcessTree: true); } catch { }
+            }
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception or IOException)
+        {
+        }
+    }
+
+    private static int ForceKillAll(out List<string> errors)
+    {
+        errors = [];
+        var terminated = 0;
+        foreach (var process in EnumerateCursorProcesses())
+        {
+            try
+            {
+                if (!process.HasExited)
+                {
+                    process.Kill(entireProcessTree: true);
+                    terminated++;
+                }
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception or NotSupportedException)
+            {
+                errors.Add(ex.Message);
+            }
+            finally
+            {
+                process.Dispose();
+            }
+        }
+
+        return terminated;
+    }
+
+    private static async Task<bool> WaitUntilStoppedAsync(TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (DateTime.UtcNow < deadline)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!IsAnyCursorProcessRunning())
+            {
+                return true;
+            }
+
+            try
+            {
+                await Task.Delay(PollInterval, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+        }
+
+        return !IsAnyCursorProcessRunning();
+    }
+
+    private static bool IsAnyCursorProcessRunning()
+    {
+        var processes = EnumerateCursorProcesses();
+        var running = processes.Count > 0;
+        DisposeAll(processes);
+        return running;
+    }
+
+    private static void DisposeAll(IEnumerable<Process> processes)
+    {
+        foreach (var process in processes)
+        {
+            process.Dispose();
+        }
     }
 }
 

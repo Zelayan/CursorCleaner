@@ -22,6 +22,12 @@ public static class DisplayText
         _ => source.ToString()
     };
 
+    public static string FormatSessionSize(SessionInfo session)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+        return session.DisplaySizeText;
+    }
+
     public static string Theme(CleanerTheme theme) => theme switch
     {
         CleanerTheme.System => "跟随系统",

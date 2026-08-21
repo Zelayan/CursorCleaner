@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using CursorCleaner.Helpers;
 using CursorCleaner.Models;
 
@@ -9,17 +10,31 @@ namespace CursorCleaner.Services;
 
 public sealed class BackupService : IBackupService
 {
+    public const string SqliteFolderName = "sqlite";
+    public const string StagingFileName = "staging.vscdb";
+    public const string StagingFilePrefix = "staging_";
+    public const string StagingFileExtension = ".vscdb";
+    public const string CurrentFileName = "current.vscdb";
+
+    private static readonly Regex LegacyTimestampDirectory = new(
+        @"^\d{4}-\d{2}-\d{2}_\d{6}(_\d+)?$",
+        RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
     private readonly string _backupBasePath;
     private readonly ILogService _log;
     private readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web) { WriteIndented = true };
+    private readonly Func<string, long?> _availableSpace;
 
-    public BackupService(ILogService log, string? backupBasePath = null)
+    public BackupService(ILogService log, string? backupBasePath = null, Func<string, long?>? availableSpace = null)
     {
         _log = log;
         _backupBasePath = Path.GetFullPath(backupBasePath ?? Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
             "CursorCleanerBackup"));
+        _availableSpace = availableSpace ?? (path => TryGetAvailableSpace(path, out var available) ? available : null);
     }
+
+    public string BackupRootPath => _backupBasePath;
 
     public async Task<BackupOperationResult> BackupAsync(IEnumerable<CleanupPlanItem> items, CancellationToken cancellationToken = default)
     {
@@ -134,22 +149,176 @@ public sealed class BackupService : IBackupService
     {
         cancellationToken.ThrowIfCancellationRequested();
         var source = PathSafety.Normalize(databasePath);
-        Directory.CreateDirectory(_backupBasePath);
-        var backupDirectory = CreateUniqueDirectory();
-        var leaf = Path.GetFileName(source);
-        if (string.IsNullOrWhiteSpace(leaf))
+        if (!File.Exists(source))
         {
-            throw new IOException("The database backup file name is invalid.");
+            throw new IOException("The database to back up is missing.");
         }
 
-        var destination = Path.GetFullPath(Path.Combine(backupDirectory, leaf));
-        if (!PathSafety.IsWithin(destination, backupDirectory, allowRoot: false) || File.Exists(destination))
+        var requiredBytes = GetCombinedSqliteSize(source);
+        Directory.CreateDirectory(_backupBasePath);
+        var sqliteRoot = GetSqliteRoot();
+        Directory.CreateDirectory(sqliteRoot);
+        var folder = GetRollingFolder(source);
+        Directory.CreateDirectory(folder);
+
+        EnsureVolumeFreeSpace(sqliteRoot, requiredBytes, "Insufficient free space for the SQLite backup");
+
+        var destination = Path.GetFullPath(Path.Combine(folder, $"{StagingFilePrefix}{Guid.NewGuid():N}{StagingFileExtension}"));
+        if (!PathSafety.IsWithin(destination, folder, allowRoot: false) || !IsStagingFileName(Path.GetFileName(destination)))
         {
             throw new IOException("The database backup destination is unsafe.");
         }
 
+        TryDeleteDatabase(destination);
         await TryLogAsync("info", "backup.sqlite", "Reserved SQLite online backup destination.", destination, null, cancellationToken).ConfigureAwait(false);
         return destination;
+    }
+
+    public async Task<string> CommitSqliteBackupAsync(string stagingPath, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var staging = PathSafety.Normalize(stagingPath);
+        var folder = Path.GetDirectoryName(staging);
+        if (string.IsNullOrWhiteSpace(folder)
+            || !PathSafety.IsWithin(staging, GetSqliteRoot(), allowRoot: false)
+            || !IsStagingFileName(Path.GetFileName(staging))
+            || !File.Exists(staging))
+        {
+            throw new IOException("The SQLite staging backup path is invalid.");
+        }
+
+        var current = Path.GetFullPath(Path.Combine(folder, CurrentFileName));
+        if (!PathSafety.IsWithin(current, folder, allowRoot: false))
+        {
+            throw new IOException("The SQLite current backup destination is unsafe.");
+        }
+
+        File.Move(staging, current, overwrite: true);
+        TryDelete(staging + "-wal");
+        TryDelete(staging + "-shm");
+        TryDelete(staging + "-journal");
+        await TryLogAsync("info", "backup.sqlite.commit", "Committed verified SQLite backup as current.", current, null, cancellationToken).ConfigureAwait(false);
+        return current;
+    }
+
+    public void EnsureVolumeFreeSpace(string pathOnVolume, long requiredBytes, string operationLabel)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(pathOnVolume);
+        ArgumentException.ThrowIfNullOrWhiteSpace(operationLabel);
+        if (requiredBytes < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(requiredBytes));
+        }
+
+        var probePath = ResolveExistingPath(PathSafety.Normalize(pathOnVolume));
+        var available = _availableSpace(probePath);
+        if (available is null)
+        {
+            throw new IOException($"{operationLabel}; free space could not be determined.");
+        }
+
+        if (available.Value < requiredBytes)
+        {
+            throw new IOException($"{operationLabel}; {requiredBytes} bytes required.");
+        }
+    }
+
+    private static string ResolveExistingPath(string path)
+    {
+        var current = path;
+        while (!string.IsNullOrWhiteSpace(current) && !Directory.Exists(current) && !File.Exists(current))
+        {
+            var parent = Path.GetDirectoryName(current);
+            if (string.IsNullOrWhiteSpace(parent) || string.Equals(parent, current, StringComparison.Ordinal))
+            {
+                break;
+            }
+
+            current = parent;
+        }
+
+        return string.IsNullOrWhiteSpace(current) ? path : current;
+    }
+
+    public static bool IsStagingFileName(string? fileName)
+    {
+        if (string.IsNullOrWhiteSpace(fileName))
+        {
+            return false;
+        }
+
+        if (string.Equals(fileName, StagingFileName, StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        return fileName.StartsWith(StagingFilePrefix, StringComparison.Ordinal)
+               && fileName.EndsWith(StagingFileExtension, StringComparison.Ordinal)
+               && fileName.Length > StagingFilePrefix.Length + StagingFileExtension.Length;
+    }
+
+    public SqliteBackupUsage GetSqliteBackupUsage()
+    {
+        var sqliteRoot = GetSqliteRoot();
+        var rollingBytes = 0L;
+        var rollingCount = 0;
+        if (Directory.Exists(sqliteRoot))
+        {
+            foreach (var folder in Directory.EnumerateDirectories(sqliteRoot))
+            {
+                var current = Path.Combine(folder, CurrentFileName);
+                if (!File.Exists(current))
+                {
+                    continue;
+                }
+
+                rollingCount++;
+                rollingBytes += GetDirectorySize(folder);
+            }
+        }
+
+        var legacyBytes = 0L;
+        var legacyCount = 0;
+        if (Directory.Exists(_backupBasePath))
+        {
+            foreach (var directory in EnumerateLegacySqliteDirectories())
+            {
+                legacyCount++;
+                legacyBytes += GetDirectorySize(directory);
+            }
+        }
+
+        return new SqliteBackupUsage(_backupBasePath, rollingBytes, rollingCount, legacyBytes, legacyCount);
+    }
+
+    public async Task<SqliteBackupCleanupResult> CleanupLegacySqliteBackupsAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var deleted = 0;
+        var reclaimed = 0L;
+        try
+        {
+            foreach (var directory in EnumerateLegacySqliteDirectories().ToArray())
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var size = GetDirectorySize(directory);
+                Directory.Delete(directory, recursive: true);
+                deleted++;
+                reclaimed += size;
+                await TryLogAsync("info", "backup.sqlite.legacy", "Deleted a legacy timestamped SQLite backup directory.", directory, null, cancellationToken).ConfigureAwait(false);
+            }
+
+            return new SqliteBackupCleanupResult(true, deleted, reclaimed, null);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            await TryLogAsync("error", "backup.sqlite.legacy", "Failed to delete a legacy timestamped SQLite backup directory.", _backupBasePath, ex, CancellationToken.None).ConfigureAwait(false);
+            return new SqliteBackupCleanupResult(false, deleted, reclaimed, ex.Message);
+        }
     }
 
     private string CreateUniqueDirectory()
@@ -170,6 +339,121 @@ public sealed class BackupService : IBackupService
             {
             }
         }
+    }
+
+    private string GetSqliteRoot() => Path.GetFullPath(Path.Combine(_backupBasePath, SqliteFolderName));
+
+    private string GetRollingFolder(string databasePath)
+    {
+        var leaf = Path.GetFileName(databasePath);
+        if (string.IsNullOrWhiteSpace(leaf))
+        {
+            throw new IOException("The database backup file name is invalid.");
+        }
+
+        var safeLeaf = string.Concat(leaf.Select(character => Path.GetInvalidFileNameChars().Contains(character) ? '_' : character));
+        var hash = Sha256Prefix(CanonicalPath(databasePath));
+        var folder = Path.GetFullPath(Path.Combine(GetSqliteRoot(), $"{safeLeaf}_{hash}"));
+        if (!PathSafety.IsWithin(folder, GetSqliteRoot(), allowRoot: false))
+        {
+            throw new IOException("The SQLite rolling backup folder is unsafe.");
+        }
+
+        return folder;
+    }
+
+    private IEnumerable<string> EnumerateLegacySqliteDirectories()
+    {
+        if (!Directory.Exists(_backupBasePath))
+        {
+            yield break;
+        }
+
+        foreach (var directory in Directory.EnumerateDirectories(_backupBasePath))
+        {
+            var name = Path.GetFileName(directory);
+            if (string.Equals(name, SqliteFolderName, StringComparison.Ordinal)
+                || !LegacyTimestampDirectory.IsMatch(name)
+                || !IsLegacySqliteBackupDirectory(directory))
+            {
+                continue;
+            }
+
+            yield return directory;
+        }
+    }
+
+    private static bool IsLegacySqliteBackupDirectory(string directory)
+    {
+        if (Directory.Exists(Path.Combine(directory, "files")))
+        {
+            return false;
+        }
+
+        string[] entries;
+        try
+        {
+            entries = Directory.GetFileSystemEntries(directory);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+
+        if (entries.Length == 0)
+        {
+            return false;
+        }
+
+        foreach (var entry in entries)
+        {
+            if (Directory.Exists(entry))
+            {
+                return false;
+            }
+
+            var extension = Path.GetExtension(entry);
+            if (!extension.Equals(".vscdb", StringComparison.OrdinalIgnoreCase)
+                && !extension.Equals(".db", StringComparison.OrdinalIgnoreCase)
+                && !extension.Equals(".sqlite", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static long GetCombinedSqliteSize(string path)
+    {
+        return new[] { path, path + "-wal", path + "-shm" }
+            .Where(File.Exists)
+            .Sum(candidate => new FileInfo(candidate).Length);
+    }
+
+    private static long GetDirectorySize(string directory)
+    {
+        try
+        {
+            return Directory.EnumerateFiles(directory, "*", SearchOption.AllDirectories)
+                .Sum(file => new FileInfo(file).Length);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return 0;
+        }
+    }
+
+    private static string CanonicalPath(string path)
+    {
+        var normalized = PathSafety.Normalize(path);
+        return OperatingSystem.IsWindows() ? normalized.ToUpperInvariant() : normalized;
+    }
+
+    private static string Sha256Prefix(string value)
+    {
+        var bytes = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(value));
+        return Convert.ToHexString(bytes.AsSpan(0, 8));
     }
 
     private static string BuildRootFolder(CursorDataRoot root)
@@ -216,6 +500,14 @@ public sealed class BackupService : IBackupService
     private static void TryDelete(string path)
     {
         try { File.Delete(path); } catch { }
+    }
+
+    private static void TryDeleteDatabase(string path)
+    {
+        TryDelete(path);
+        TryDelete(path + "-wal");
+        TryDelete(path + "-shm");
+        TryDelete(path + "-journal");
     }
 }
 

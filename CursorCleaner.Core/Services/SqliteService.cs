@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.IO;
 using System.Text.Json;
 using CursorCleaner.Helpers;
@@ -8,6 +9,8 @@ namespace CursorCleaner.Services;
 
 public sealed class SqliteService : ISqliteService
 {
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim> DatabaseLocks = new(StringComparer.Ordinal);
+
     private readonly IProcessService _processService;
     private readonly IPathGuard _pathGuard;
     private readonly IBackupService _backupService;
@@ -35,6 +38,22 @@ public sealed class SqliteService : ISqliteService
         }
 
         var path = guard.NormalizedPath!;
+        var gate = await AcquireDatabaseLockAsync(path, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await VacuumCoreAsync(path, roots, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    private async Task<SqliteMaintenanceResult> VacuumCoreAsync(
+        string path,
+        IReadOnlyList<string> roots,
+        CancellationToken cancellationToken)
+    {
         if (!_pathGuard.TryGetFileIdentity(path, out var initialIdentity, out var identityError))
         {
             return Failure(path, 0, null, identityError ?? "Database identity verification failed.");
@@ -60,10 +79,19 @@ public sealed class SqliteService : ISqliteService
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
+
+            // Source volume must hold a VACUUM rewrite (~DB size). Backup volume is checked when
+            // CreateSqliteBackupPathAsync reserves staging (after the backup root exists).
+            var sourceProbe = Path.GetDirectoryName(path) ?? path;
+            _backupService.EnsureVolumeFreeSpace(
+                sourceProbe,
+                sizeBefore,
+                "Insufficient free space on the database volume for VACUUM");
+
             await using var connection = new SqliteConnection(BuildConnectionString(path, SqliteOpenMode.ReadWrite));
             await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
 
-            guard = _pathGuard.ValidateSqliteTarget(path, roots);
+            var guard = _pathGuard.ValidateSqliteTarget(path, roots);
             if (!guard.IsSafe || !IdentityMatches(path, initialIdentity, out identityError))
             {
                 return Failure(path, sizeBefore, null, guard.Error ?? identityError ?? "Database changed while opening the write connection.");
@@ -77,14 +105,7 @@ public sealed class SqliteService : ISqliteService
             await RunQuickCheckAsync(connection, cancellationToken).ConfigureAwait(false);
 
             reservedBackupPath = await _backupService.CreateSqliteBackupPathAsync(path, cancellationToken).ConfigureAwait(false);
-            await using (var backupConnection = new SqliteConnection(BuildConnectionString(reservedBackupPath, SqliteOpenMode.ReadWriteCreate)))
-            {
-                await backupConnection.OpenAsync(cancellationToken).ConfigureAwait(false);
-                connection.BackupDatabase(backupConnection);
-                await RunQuickCheckAsync(backupConnection, cancellationToken).ConfigureAwait(false);
-            }
-
-            verifiedBackupPath = reservedBackupPath;
+            verifiedBackupPath = await CreateVerifiedBackupAsync(connection, reservedBackupPath, cancellationToken).ConfigureAwait(false);
 
             cancellationToken.ThrowIfCancellationRequested();
             guard = _pathGuard.ValidateSqliteTarget(path, roots);
@@ -115,6 +136,8 @@ public sealed class SqliteService : ISqliteService
             await using var vacuum = connection.CreateCommand();
             vacuum.CommandText = "VACUUM;";
             await vacuum.ExecuteNonQueryAsync(CancellationToken.None).ConfigureAwait(false);
+
+            await RunQuickCheckAsync(connection, CancellationToken.None).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -196,24 +219,54 @@ public sealed class SqliteService : ISqliteService
         }
 
         var results = new List<SqliteChatDatabaseResult>();
+        var cancelled = false;
         foreach (var databasePath in paths)
         {
-            cancellationToken.ThrowIfCancellationRequested();
+            if (cancellationToken.IsCancellationRequested)
+            {
+                cancelled = true;
+                break;
+            }
+
             if (_processService.IsCursorRunning())
             {
                 results.Add(new SqliteChatDatabaseResult(databasePath, false, 0, null, "Cursor started; remaining databases were not modified."));
                 continue;
             }
 
-            results.Add(await DeleteFromDatabaseAsync(databasePath, ids, roots, cancellationToken).ConfigureAwait(false));
+            try
+            {
+                results.Add(await DeleteFromDatabaseAsync(databasePath, ids, roots, cancellationToken).ConfigureAwait(false));
+            }
+            catch (OperationCanceledException)
+            {
+                // Lock acquisition or outer cancel must not drop already-completed database results.
+                cancelled = true;
+                break;
+            }
         }
 
-        var blocked = results.Any(item => item.Error?.Contains("Cursor", StringComparison.OrdinalIgnoreCase) == true && !item.Succeeded);
-        var succeeded = results.Count > 0 && results.All(item => item.Succeeded);
-        var error = succeeded
-            ? null
-            : results.Where(item => !item.Succeeded).Select(item => item.Error).FirstOrDefault() ?? "SQLite chat deletion failed.";
-        return new SqliteChatCleanupResult(succeeded, blocked && !results.Any(item => item.Succeeded), results, error);
+        var anySuccess = results.Any(item => item.Succeeded);
+        var blocked = results.Any(item => item.Error?.Contains("Cursor", StringComparison.OrdinalIgnoreCase) == true && !item.Succeeded)
+                      && !anySuccess;
+        var succeeded = !cancelled && results.Count > 0 && results.All(item => item.Succeeded);
+        string? error;
+        if (succeeded)
+        {
+            error = null;
+        }
+        else if (cancelled)
+        {
+            error = results.Count == 0
+                ? "Chat record deletion was cancelled before any database was processed."
+                : "Chat record deletion was cancelled; completed databases were kept and remaining databases were not modified.";
+        }
+        else
+        {
+            error = results.Where(item => !item.Succeeded).Select(item => item.Error).FirstOrDefault() ?? "SQLite chat deletion failed.";
+        }
+
+        return new SqliteChatCleanupResult(succeeded, blocked, results, error, cancelled);
     }
 
     private async Task<SqliteChatDatabaseResult> DeleteFromDatabaseAsync(
@@ -229,6 +282,23 @@ public sealed class SqliteService : ISqliteService
         }
 
         var path = guard.NormalizedPath!;
+        var gate = await AcquireDatabaseLockAsync(path, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await DeleteFromDatabaseCoreAsync(path, ids, roots, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    private async Task<SqliteChatDatabaseResult> DeleteFromDatabaseCoreAsync(
+        string path,
+        IReadOnlyList<string> ids,
+        IReadOnlyList<string> roots,
+        CancellationToken cancellationToken)
+    {
         if (!_pathGuard.TryGetFileIdentity(path, out var initialIdentity, out var identityError))
         {
             return new SqliteChatDatabaseResult(path, false, 0, null, identityError ?? "Database identity verification failed.");
@@ -247,7 +317,7 @@ public sealed class SqliteService : ISqliteService
             await using var connection = new SqliteConnection(BuildConnectionString(path, SqliteOpenMode.ReadWrite));
             await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
 
-            guard = _pathGuard.ValidateSqliteTarget(path, roots);
+            var guard = _pathGuard.ValidateSqliteTarget(path, roots);
             if (!guard.IsSafe || !IdentityMatches(path, initialIdentity, out identityError))
             {
                 return new SqliteChatDatabaseResult(path, false, 0, null, guard.Error ?? identityError ?? "Database changed while opening the write connection.");
@@ -271,15 +341,13 @@ public sealed class SqliteService : ISqliteService
                 return new SqliteChatDatabaseResult(path, true, 0, null, "Skipped: no Cursor chat records were found.");
             }
 
-            reservedBackupPath = await _backupService.CreateSqliteBackupPathAsync(path, cancellationToken).ConfigureAwait(false);
-            await using (var backupConnection = new SqliteConnection(BuildConnectionString(reservedBackupPath, SqliteOpenMode.ReadWriteCreate)))
+            if (!await CursorChatSchema.HasMatchingConversationAsync(connection, shape, ids, cancellationToken).ConfigureAwait(false))
             {
-                await backupConnection.OpenAsync(cancellationToken).ConfigureAwait(false);
-                connection.BackupDatabase(backupConnection);
-                await RunQuickCheckAsync(backupConnection, cancellationToken).ConfigureAwait(false);
+                return new SqliteChatDatabaseResult(path, true, 0, null, "No matching chat rows were found.");
             }
 
-            verifiedBackupPath = reservedBackupPath;
+            reservedBackupPath = await _backupService.CreateSqliteBackupPathAsync(path, cancellationToken).ConfigureAwait(false);
+            verifiedBackupPath = await CreateVerifiedBackupAsync(connection, reservedBackupPath, cancellationToken).ConfigureAwait(false);
 
             cancellationToken.ThrowIfCancellationRequested();
             guard = _pathGuard.ValidateSqliteTarget(path, roots);
@@ -346,6 +414,33 @@ public sealed class SqliteService : ISqliteService
 
         error = null;
         return true;
+    }
+
+    private async Task<string> CreateVerifiedBackupAsync(SqliteConnection connection, string stagingPath, CancellationToken cancellationToken)
+    {
+        await using (var backupConnection = new SqliteConnection(BuildConnectionString(stagingPath, SqliteOpenMode.ReadWriteCreate)))
+        {
+            await backupConnection.OpenAsync(cancellationToken).ConfigureAwait(false);
+            connection.BackupDatabase(backupConnection);
+            await RunQuickCheckAsync(backupConnection, cancellationToken).ConfigureAwait(false);
+            await RunCheckpointAsync(backupConnection, cancellationToken).ConfigureAwait(false);
+        }
+
+        return await _backupService.CommitSqliteBackupAsync(stagingPath, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task<SemaphoreSlim> AcquireDatabaseLockAsync(string path, CancellationToken cancellationToken)
+    {
+        var key = CanonicalLockKey(path);
+        var gate = DatabaseLocks.GetOrAdd(key, static _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        return gate;
+    }
+
+    private static string CanonicalLockKey(string path)
+    {
+        var normalized = PathSafety.Normalize(path);
+        return OperatingSystem.IsWindows() ? normalized.ToUpperInvariant() : normalized;
     }
 
     private static async Task RunCheckpointAsync(SqliteConnection connection, CancellationToken cancellationToken)
@@ -417,9 +512,12 @@ public sealed class SqliteService : ISqliteService
 
         try
         {
-            if (File.Exists(path))
+            foreach (var candidate in new[] { path, path + "-wal", path + "-shm", path + "-journal" })
             {
-                File.Delete(path);
+                if (File.Exists(candidate))
+                {
+                    File.Delete(candidate);
+                }
             }
         }
         catch

@@ -126,6 +126,59 @@ internal static class CursorChatSchema
         return false;
     }
 
+    /// <summary>
+    /// Lightweight existence check used before online backup so unrelated chat DBs are not copied.
+    /// </summary>
+    public static async Task<bool> HasMatchingConversationAsync(
+        SqliteConnection connection,
+        DatabaseShape shape,
+        IReadOnlyList<string> conversationIds,
+        CancellationToken cancellationToken)
+    {
+        if (conversationIds.Count == 0)
+        {
+            return false;
+        }
+
+        if (shape.ComposerHeaders &&
+            await AnyByIdAsync(connection, "composerHeaders", "composerId", conversationIds, cancellationToken).ConfigureAwait(false))
+        {
+            return true;
+        }
+
+        if (shape.Conversations &&
+            await AnyByIdAsync(connection, "conversations", "id", conversationIds, cancellationToken).ConfigureAwait(false))
+        {
+            return true;
+        }
+
+        if (shape.ConversationSearchCandidates &&
+            await AnyByIdAsync(connection, "conversation_search_candidates", "id", conversationIds, cancellationToken).ConfigureAwait(false))
+        {
+            return true;
+        }
+
+        if (shape.CursorDiskKv &&
+            await AnyKeyedChatRowsAsync(connection, "cursorDiskKV", conversationIds, cancellationToken).ConfigureAwait(false))
+        {
+            return true;
+        }
+
+        if (shape.ItemTable &&
+            await AnyKeyedChatRowsAsync(connection, "ItemTable", conversationIds, cancellationToken).ConfigureAwait(false))
+        {
+            return true;
+        }
+
+        if (shape.LegacyComposerData &&
+            await LegacyComposerDataContainsAsync(connection, conversationIds, cancellationToken).ConfigureAwait(false))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
     public static async Task<IReadOnlyList<ComposerRecord>> ListComposersAsync(
         SqliteConnection connection,
         string databasePath,
@@ -156,7 +209,7 @@ internal static class CursorChatSchema
 
                 var workspace = reader.IsDBNull(1) ? null : reader.GetString(1);
                 var timestamp = FirstTimestamp(reader, 4, 3, 2);
-                var title = TryReadComposerTitle(ReadOptionalString(reader, 6)) ?? BuildFallbackTitle(workspace, timestamp);
+                var title = TryReadComposerTitle(ReadOptionalString(reader, 6)) ?? BuildFallbackTitle(workspace, timestamp, id);
                 records[id!] = new ComposerRecord(id!, title, workspace, timestamp, databasePath);
             }
         }
@@ -194,7 +247,7 @@ internal static class CursorChatSchema
 
                     records[id!] = new ComposerRecord(
                         id!,
-                        string.IsNullOrWhiteSpace(title) ? BuildFallbackTitle(null, timestamp) : title.Trim(),
+                        string.IsNullOrWhiteSpace(title) ? BuildFallbackTitle(null, timestamp, id) : title.Trim(),
                         null,
                         timestamp,
                         databasePath);
@@ -362,6 +415,108 @@ internal static class CursorChatSchema
         }
 
         return deleted;
+    }
+
+    private static async Task<bool> AnyByIdAsync(
+        SqliteConnection connection,
+        string table,
+        string column,
+        IReadOnlyList<string> ids,
+        CancellationToken cancellationToken)
+    {
+        foreach (var id in ids)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await using var command = connection.CreateCommand();
+            command.CommandText =
+                $"SELECT 1 FROM \"{table.Replace("\"", "\"\"", StringComparison.Ordinal)}\" WHERE \"{column.Replace("\"", "\"\"", StringComparison.Ordinal)}\" = @id LIMIT 1;";
+            command.Parameters.AddWithValue("@id", id);
+            var value = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+            if (value is not null and not DBNull)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static async Task<bool> AnyKeyedChatRowsAsync(
+        SqliteConnection connection,
+        string table,
+        IReadOnlyList<string> ids,
+        CancellationToken cancellationToken)
+    {
+        var quoted = table.Replace("\"", "\"\"", StringComparison.Ordinal);
+        foreach (var id in ids)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await using var command = connection.CreateCommand();
+            command.CommandText =
+                $"""
+                 SELECT 1 FROM "{quoted}"
+                 WHERE key = @composerData
+                    OR key = @composerChat
+                    OR key = @itemComposerData
+                    OR key = @editorPanel
+                    OR key = @fullscreen
+                    OR key LIKE @bubblePrefix ESCAPE '\'
+                    OR key LIKE @checkpointPrefix ESCAPE '\'
+                 LIMIT 1;
+                 """;
+            command.Parameters.AddWithValue("@composerData", "composerData:" + id);
+            command.Parameters.AddWithValue("@composerChat", "composerChat:" + id);
+            command.Parameters.AddWithValue("@itemComposerData", "composerData:" + id);
+            command.Parameters.AddWithValue("@editorPanel", "glass/cursor.editorPanelVisibility.agent/" + id);
+            command.Parameters.AddWithValue("@fullscreen", "cursor/glass.editorPanelFullscreen/" + id);
+            command.Parameters.AddWithValue("@bubblePrefix", EscapeLike("bubbleId:" + id + ":") + "%");
+            command.Parameters.AddWithValue("@checkpointPrefix", EscapeLike("checkpointId:" + id + ":") + "%");
+            var value = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+            if (value is not null and not DBNull)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static async Task<bool> LegacyComposerDataContainsAsync(
+        SqliteConnection connection,
+        IReadOnlyList<string> ids,
+        CancellationToken cancellationToken)
+    {
+        await using var select = connection.CreateCommand();
+        select.CommandText = "SELECT value FROM ItemTable WHERE key = 'composer.composerData' LIMIT 1;";
+        var raw = await select.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        if (raw is null or DBNull)
+        {
+            return false;
+        }
+
+        var json = raw switch
+        {
+            string text => text,
+            byte[] bytes => Encoding.UTF8.GetString(bytes),
+            _ => raw.ToString()
+        };
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return false;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(json);
+            var present = new HashSet<string>(
+                CollectJsonConversationIds(document.RootElement),
+                StringComparer.OrdinalIgnoreCase);
+            return ids.Any(present.Contains);
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
     }
 
     private static async Task<int> DeleteKeyedChatRowsAsync(
@@ -547,10 +702,18 @@ internal static class CursorChatSchema
         return null;
     }
 
-    private static string BuildFallbackTitle(string? projectName, DateTime timestamp)
+    private static string BuildFallbackTitle(string? projectName, DateTime timestamp, string? composerId = null)
     {
         var prefix = string.IsNullOrWhiteSpace(projectName) ? "Cursor session" : projectName;
-        return $"{prefix} - {timestamp.ToLocalTime():yyyy-MM-dd HH:mm}";
+        var title = $"{prefix} - {timestamp.ToLocalTime():yyyy-MM-dd HH:mm}";
+        if (string.IsNullOrWhiteSpace(projectName) &&
+            !string.IsNullOrWhiteSpace(composerId) &&
+            composerId.Length >= 8)
+        {
+            title += $" · {composerId[..8]}";
+        }
+
+        return title;
     }
 
     private static DateTime FirstTimestamp(SqliteDataReader reader, params int[] ordinals)

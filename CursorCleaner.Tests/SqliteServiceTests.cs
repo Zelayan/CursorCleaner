@@ -22,6 +22,7 @@ public sealed class SqliteServiceTests
         Assert.IsTrue(result.Succeeded, result.Error);
         Assert.IsNotNull(result.BackupPath);
         Assert.IsTrue(File.Exists(result.BackupPath));
+        Assert.AreEqual(BackupService.CurrentFileName, Path.GetFileName(result.BackupPath));
         await AssertQuickCheckAsync(result.BackupPath);
         Assert.IsTrue(result.SizeAfter >= 0);
     }
@@ -101,6 +102,7 @@ public sealed class SqliteServiceTests
         Assert.IsTrue(result.DeletedRows > 0);
         Assert.IsNotNull(result.Databases[0].BackupPath);
         Assert.IsTrue(File.Exists(result.Databases[0].BackupPath));
+        Assert.AreEqual(BackupService.CurrentFileName, Path.GetFileName(result.Databases[0].BackupPath));
 
         await using var connection = Open(database);
         Assert.AreEqual(0L, await CountAsync(connection, $"SELECT COUNT(*) FROM composerHeaders WHERE composerId = '{SqliteChatFixtures.KeepId}';"));
@@ -139,6 +141,121 @@ public sealed class SqliteServiceTests
         Assert.AreEqual(0L, await CountAsync(connection, $"SELECT COUNT(*) FROM conversation_search_candidates WHERE id = '{SqliteChatFixtures.KeepId}';"));
         Assert.AreEqual(0L, await CountAsync(connection, "SELECT COUNT(*) FROM conversation_fts WHERE title = 'Greeting conversation';"));
         Assert.AreEqual(1L, await CountAsync(connection, "SELECT COUNT(*) FROM conversation_fts WHERE title = 'Capabilities inquiry';"));
+    }
+
+    [TestMethod]
+    public async Task DeleteChatRecords_SecondDeleteReplacesRollingBackup()
+    {
+        using var temp = new TemporaryDirectory();
+        var root = Path.Combine(temp.Path, "approved");
+        Directory.CreateDirectory(root);
+        var database = Path.Combine(root, "state.vscdb");
+        await SqliteChatFixtures.CreateStateDatabaseAsync(database);
+        var backupRoot = Path.Combine(temp.Path, "backups");
+        var service = CreateService(temp.Path);
+
+        var first = await service.DeleteChatRecordsAsync([SqliteChatFixtures.KeepId], [database], [root]);
+        Assert.IsTrue(first.Succeeded, first.Error);
+        var firstBackup = first.Databases[0].BackupPath!;
+        Assert.AreEqual(BackupService.CurrentFileName, Path.GetFileName(firstBackup));
+        var firstBytes = await File.ReadAllBytesAsync(firstBackup);
+
+        var second = await service.DeleteChatRecordsAsync([SqliteChatFixtures.ExtraId], [database], [root]);
+        Assert.IsTrue(second.Succeeded, second.Error);
+        var secondBackup = second.Databases[0].BackupPath!;
+        Assert.AreEqual(firstBackup, secondBackup);
+        Assert.IsTrue(File.Exists(secondBackup));
+        CollectionAssert.AreNotEqual(firstBytes, await File.ReadAllBytesAsync(secondBackup));
+        Assert.AreEqual(1, Directory.GetFiles(Path.GetDirectoryName(secondBackup)!, "*", SearchOption.AllDirectories).Count(path => Path.GetFileName(path) == BackupService.CurrentFileName));
+        Assert.IsFalse(Directory.GetFiles(Path.GetDirectoryName(secondBackup)!).Any(path => BackupService.IsStagingFileName(Path.GetFileName(path))));
+        Assert.AreEqual(1, Directory.GetDirectories(Path.Combine(backupRoot, BackupService.SqliteFolderName)).Length);
+    }
+
+    [TestMethod]
+    public async Task DeleteChatRecords_UnmatchedIdsSkipBackup()
+    {
+        using var temp = new TemporaryDirectory();
+        var root = Path.Combine(temp.Path, "approved");
+        Directory.CreateDirectory(root);
+        var database = Path.Combine(root, "state.vscdb");
+        await SqliteChatFixtures.CreateStateDatabaseAsync(database);
+        var original = await File.ReadAllBytesAsync(database);
+        var service = CreateService(temp.Path);
+        var missingId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+        var result = await service.DeleteChatRecordsAsync([missingId], [database], [root]);
+
+        Assert.IsTrue(result.Succeeded, result.Error);
+        Assert.AreEqual(0, result.DeletedRows);
+        Assert.IsNull(result.Databases[0].BackupPath);
+        CollectionAssert.AreEqual(original, await File.ReadAllBytesAsync(database));
+        Assert.IsFalse(Directory.Exists(Path.Combine(temp.Path, "backups", BackupService.SqliteFolderName))
+            && Directory.GetDirectories(Path.Combine(temp.Path, "backups", BackupService.SqliteFolderName)).Length > 0);
+    }
+
+    [TestMethod]
+    public async Task DeleteChatRecords_CancelAfterFirstDatabaseKeepsPartialResults()
+    {
+        using var temp = new TemporaryDirectory();
+        var firstRoot = Path.Combine(temp.Path, "approved", "cursor");
+        var secondRoot = Path.Combine(temp.Path, "approved", "insiders");
+        Directory.CreateDirectory(firstRoot);
+        Directory.CreateDirectory(secondRoot);
+        var firstDatabase = Path.Combine(firstRoot, "state.vscdb");
+        var secondDatabase = Path.Combine(secondRoot, "state.vscdb");
+        await SqliteChatFixtures.CreateStateDatabaseAsync(firstDatabase);
+        await SqliteChatFixtures.CreateStateDatabaseAsync(secondDatabase);
+        var log = new LogService(Path.Combine(temp.Path, "logs"));
+        var service = new SqliteService(
+            new NeverRunningProcessService(),
+            new PathGuard([firstRoot, secondRoot]),
+            new BackupService(log, Path.Combine(temp.Path, "backups")),
+            log);
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        var result = await service.DeleteChatRecordsAsync(
+            [SqliteChatFixtures.KeepId],
+            [firstDatabase, secondDatabase],
+            [firstRoot, secondRoot],
+            cts.Token);
+
+        Assert.IsTrue(result.Cancelled);
+        Assert.IsFalse(result.Succeeded);
+        Assert.AreEqual(0, result.Databases.Count);
+        Assert.IsTrue(File.Exists(firstDatabase));
+    }
+
+    [TestMethod]
+    public async Task Vacuum_InsufficientSourceVolumeSpaceDoesNotWrite()
+    {
+        using var temp = new TemporaryDirectory();
+        var root = Path.Combine(temp.Path, "approved");
+        Directory.CreateDirectory(root);
+        var database = Path.Combine(root, "test.db");
+        await CreateDatabaseAsync(database);
+        var original = await File.ReadAllBytesAsync(database);
+        var log = new LogService(Path.Combine(temp.Path, "logs"));
+        // Enough space only when probing backup root; source volume reports 0.
+        var backupRoot = Path.Combine(temp.Path, "backups");
+        var service = new SqliteService(
+            new NeverRunningProcessService(),
+            new PathGuard([root]),
+            new BackupService(log, backupRoot, path =>
+            {
+                var normalized = Path.GetFullPath(path);
+                return normalized.StartsWith(Path.GetFullPath(backupRoot), StringComparison.OrdinalIgnoreCase)
+                    ? long.MaxValue
+                    : 0;
+            }),
+            log);
+
+        var result = await service.VacuumAsync(database, [root]);
+
+        Assert.IsFalse(result.Succeeded);
+        StringAssert.Contains(result.Error!, "database volume");
+        Assert.IsNull(result.BackupPath);
+        CollectionAssert.AreEqual(original, await File.ReadAllBytesAsync(database));
     }
 
     [TestMethod]
@@ -186,6 +303,61 @@ public sealed class SqliteServiceTests
 
         Assert.IsFalse(result.Succeeded);
         Assert.IsTrue(result.Blocked);
+        CollectionAssert.AreEqual(original, await File.ReadAllBytesAsync(database));
+    }
+
+    [TestMethod]
+    public async Task DeleteChatRecords_SameNameDatabasesKeepSeparateBackups()
+    {
+        using var temp = new TemporaryDirectory();
+        var firstRoot = Path.Combine(temp.Path, "approved", "cursor");
+        var secondRoot = Path.Combine(temp.Path, "approved", "insiders");
+        Directory.CreateDirectory(firstRoot);
+        Directory.CreateDirectory(secondRoot);
+        var firstDatabase = Path.Combine(firstRoot, "state.vscdb");
+        var secondDatabase = Path.Combine(secondRoot, "state.vscdb");
+        await SqliteChatFixtures.CreateStateDatabaseAsync(firstDatabase);
+        await SqliteChatFixtures.CreateStateDatabaseAsync(secondDatabase);
+        var log = new LogService(Path.Combine(temp.Path, "logs"));
+        var service = new SqliteService(
+            new NeverRunningProcessService(),
+            new PathGuard([firstRoot, secondRoot]),
+            new BackupService(log, Path.Combine(temp.Path, "backups")),
+            log);
+
+        var result = await service.DeleteChatRecordsAsync(
+            [SqliteChatFixtures.KeepId],
+            [firstDatabase, secondDatabase],
+            [firstRoot, secondRoot]);
+
+        Assert.IsTrue(result.Succeeded, result.Error);
+        Assert.AreEqual(2, result.Databases.Count);
+        Assert.AreNotEqual(result.Databases[0].BackupPath, result.Databases[1].BackupPath);
+        Assert.IsTrue(File.Exists(result.Databases[0].BackupPath));
+        Assert.IsTrue(File.Exists(result.Databases[1].BackupPath));
+    }
+
+    [TestMethod]
+    public async Task DeleteChatRecords_InsufficientSpaceDoesNotWrite()
+    {
+        using var temp = new TemporaryDirectory();
+        var root = Path.Combine(temp.Path, "approved");
+        Directory.CreateDirectory(root);
+        var database = Path.Combine(root, "state.vscdb");
+        await SqliteChatFixtures.CreateStateDatabaseAsync(database);
+        var original = await File.ReadAllBytesAsync(database);
+        var log = new LogService(Path.Combine(temp.Path, "logs"));
+        var service = new SqliteService(
+            new NeverRunningProcessService(),
+            new PathGuard([root]),
+            new BackupService(log, Path.Combine(temp.Path, "backups"), _ => 0),
+            log);
+
+        var result = await service.DeleteChatRecordsAsync([SqliteChatFixtures.KeepId], [database], [root]);
+
+        Assert.IsFalse(result.Succeeded);
+        StringAssert.Contains(result.Error!, "Insufficient free space");
+        Assert.IsNull(result.Databases[0].BackupPath);
         CollectionAssert.AreEqual(original, await File.ReadAllBytesAsync(database));
     }
 
@@ -273,10 +445,14 @@ public sealed class SqliteServiceTests
     private sealed class NeverRunningProcessService : IProcessService
     {
         public bool IsCursorRunning() => false;
+        public Task<StopCursorResult> StopCursorAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult(new StopCursorResult(true, false, 0, null));
     }
 
     private sealed class AlwaysRunningProcessService : IProcessService
     {
         public bool IsCursorRunning() => true;
+        public Task<StopCursorResult> StopCursorAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult(new StopCursorResult(false, true, 0, "still running"));
     }
 }

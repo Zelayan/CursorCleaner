@@ -20,12 +20,15 @@
         </Grid.ColumnDefinitions>
         <StackPanel VerticalAlignment="Center">
           <TextBlock Text="Cursor Cleaner" FontSize="20" FontWeight="SemiBold"/>
-          <TextBlock Text="Cursor 数据检查与清理工具" Classes="muted" Margin="0,2,0,0"/>
+          <TextBlock Text="扫描占用，按时间清理 Cursor 旧会话" Classes="muted" Margin="0,2,0,0"/>
         </StackPanel>
-        <StackPanel Grid.Column="1" VerticalAlignment="Center" HorizontalAlignment="Right">
+        <StackPanel Grid.Column="1" VerticalAlignment="Center" HorizontalAlignment="Right" Spacing="4">
           <TextBlock Text="{Binding BusyText}" FontWeight="SemiBold" HorizontalAlignment="Right"/>
           <TextBlock Text="{Binding ScanStatus}" Foreground="{Binding ScanStatusSeverity, Converter={StaticResource StatusBrushConverter}}" HorizontalAlignment="Right"/>
-          <TextBlock Text="{Binding CursorStateText}" Foreground="{Binding CursorStatusSeverity, Converter={StaticResource StatusBrushConverter}}" HorizontalAlignment="Right" Margin="0,2,0,0"/>
+          <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8">
+            <TextBlock Text="{Binding CursorStateText}" Foreground="{Binding CursorStatusSeverity, Converter={StaticResource StatusBrushConverter}}" VerticalAlignment="Center"/>
+            <Button Content="强制停止 Cursor" Command="{Binding StopCursorCommand}" IsVisible="{Binding CanStopCursor}" Padding="10,4"/>
+          </StackPanel>
         </StackPanel>
       </Grid>
     </Border>
@@ -62,6 +65,7 @@
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
           </Grid.RowDefinitions>
           <Grid>
@@ -71,11 +75,45 @@
             </Grid.ColumnDefinitions>
             <TextBlock Text="总览" Classes="pageTitle"/>
             <StackPanel Grid.Column="1" Orientation="Horizontal">
-              <Button Command="{Binding ScanCommand}" Classes="primary" Content="扫描"/>
+              <Button Command="{Binding ScanCommand}" Content="重新扫描"/>
               <Button Command="{Binding CancelScanCommand}" Content="取消扫描" IsVisible="{Binding IsScanning}"/>
             </StackPanel>
           </Grid>
           <Grid Grid.Row="1" Margin="0,0,0,12">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="280"/>
+              <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <Border Classes="card" Margin="0,0,8,0">
+              <StackPanel>
+                <TextBlock Text="Cursor 占用" Classes="statLabel"/>
+                <TextBlock Text="{Binding TotalBytes, Converter={StaticResource ByteSizeConverter}}" Classes="statValue"/>
+                <TextBlock Text="{Binding TotalFiles, StringFormat={}{0:N0} 个文件}" Classes="muted"/>
+                <TextBlock Text="{Binding LastScanText, StringFormat=最近扫描：{0}}" Classes="muted" Margin="0,4,0,0"/>
+              </StackPanel>
+            </Border>
+            <Border Grid.Column="1" Classes="card">
+              <StackPanel>
+                <TextBlock Text="按时间清理旧会话" Classes="sectionHeader"/>
+                <StackPanel Orientation="Horizontal" Spacing="12" Margin="0,0,0,8">
+                  <RadioButton Content="7 天" GroupName="RetentionDays" IsChecked="{Binding UseRetention7, Mode=TwoWay}"/>
+                  <RadioButton Content="30 天" GroupName="RetentionDays" IsChecked="{Binding UseRetention30, Mode=TwoWay}"/>
+                  <RadioButton Content="90 天" GroupName="RetentionDays" IsChecked="{Binding UseRetention90, Mode=TwoWay}"/>
+                </StackPanel>
+                <TextBlock Text="{Binding StaleCleanupSummaryText}" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                <StackPanel Orientation="Horizontal">
+                  <Button Classes="primary" Content="{Binding CleanupRetentionButtonText}" Command="{Binding CleanupStaleSessionsCommand}"/>
+                  <Button Content="取消清理" Command="{Binding CancelCleanupCommand}" IsVisible="{Binding IsCleaning}"/>
+                </StackPanel>
+                <TextBlock Text="{Binding OperationStatus}" Foreground="{Binding OperationStatusSeverity, Converter={StaticResource StatusBrushConverter}}" TextWrapping="Wrap" Margin="0,8,0,0"/>
+                <StackPanel Margin="0,10,0,0" IsVisible="{Binding SuggestDatabaseOptimize}">
+                  <TextBlock Text="数据库记录已清理；如需回收数据库空间，可优化数据库。" TextWrapping="Wrap"/>
+                  <Button Content="优化数据库" Command="{Binding OptimizeSuggestedDatabaseCommand}" Margin="0,8,0,0" HorizontalAlignment="Left"/>
+                </StackPanel>
+              </StackPanel>
+            </Border>
+          </Grid>
+          <Grid Grid.Row="2" Margin="0,0,0,12">
             <Grid.ColumnDefinitions>
               <ColumnDefinition/><ColumnDefinition/><ColumnDefinition/>
             </Grid.ColumnDefinitions>
@@ -84,43 +122,42 @@
             </Grid.RowDefinitions>
             <Border Classes="card" Margin="0,0,8,8">
               <StackPanel>
-                <TextBlock Text="总占用" Classes="statLabel"/>
-                <TextBlock Text="{Binding TotalBytes, Converter={StaticResource ByteSizeConverter}}" Classes="statValue"/>
-                <TextBlock Text="{Binding TotalFiles, StringFormat={}{0:N0} 个文件}" Classes="muted"/>
-              </StackPanel>
-            </Border>
-            <Border Grid.Column="1" Classes="card" Margin="0,0,8,8">
-              <StackPanel>
                 <TextBlock Text="历史会话" Classes="statLabel"/>
                 <TextBlock Text="{Binding SessionBytes, Converter={StaticResource ByteSizeConverter}}" Classes="statValue"/>
               </StackPanel>
             </Border>
-            <Border Grid.Column="2" Classes="card" Margin="0,0,0,8">
+            <Border Grid.Column="1" Classes="card" Margin="0,0,8,8">
               <StackPanel>
                 <TextBlock Text="工作区存储" Classes="statLabel"/>
                 <TextBlock Text="{Binding WorkspaceBytes, Converter={StaticResource ByteSizeConverter}}" Classes="statValue"/>
               </StackPanel>
             </Border>
-            <Border Grid.Row="1" Classes="card" Margin="0,0,8,0">
+            <Border Grid.Column="2" Classes="card" Margin="0,0,0,8">
               <StackPanel>
                 <TextBlock Text="SQLite 数据库" Classes="statLabel"/>
                 <TextBlock Text="{Binding SqliteBytes, Converter={StaticResource ByteSizeConverter}}" Classes="statValue"/>
               </StackPanel>
             </Border>
-            <Border Grid.Row="1" Grid.Column="1" Classes="card" Margin="0,0,8,0">
+            <Border Grid.Row="1" Classes="card" Margin="0,0,8,0">
               <StackPanel>
                 <TextBlock Text="代理记录" Classes="statLabel"/>
                 <TextBlock Text="{Binding AgentBytes, Converter={StaticResource ByteSizeConverter}}" Classes="statValue"/>
               </StackPanel>
             </Border>
-            <Border Grid.Row="1" Grid.Column="2" Classes="card">
+            <Border Grid.Row="1" Grid.Column="1" Classes="card" Margin="0,0,8,0">
               <StackPanel>
                 <TextBlock Text="其他数据" Classes="statLabel"/>
                 <TextBlock Text="{Binding OtherBytes, Converter={StaticResource ByteSizeConverter}}" Classes="statValue"/>
               </StackPanel>
             </Border>
+            <Border Grid.Row="1" Grid.Column="2" Classes="card">
+              <StackPanel>
+                <TextBlock Text="说明" Classes="statLabel"/>
+                <TextBlock Text="工作区、SQLite 文件和其他缓存不纳入一键清理。" Classes="muted" TextWrapping="Wrap" Margin="0,4,0,0"/>
+              </StackPanel>
+            </Border>
           </Grid>
-          <Border Grid.Row="2" Classes="card" Padding="10" Margin="0,0,0,12" IsVisible="{Binding IsProgressVisible}">
+          <Border Grid.Row="3" Classes="card" Padding="10" Margin="0,0,0,12" IsVisible="{Binding IsProgressVisible}">
             <StackPanel>
               <ProgressBar IsIndeterminate="True"/>
               <Grid Margin="0,7,0,0">
@@ -135,7 +172,7 @@
               </Grid>
             </StackPanel>
           </Border>
-          <Grid Grid.Row="3">
+          <Grid Grid.Row="4">
             <Grid.RowDefinitions>
               <RowDefinition Height="Auto"/>
               <RowDefinition Height="*"/>
@@ -166,10 +203,10 @@
                   </ContextMenu>
                 </DataGrid.ContextMenu>
               </DataGrid>
-              <Border Background="{DynamicResource SurfaceBrush}" IsVisible="{Binding HasScanResult, Converter={StaticResource BoolVisibilityConverter}, ConverterParameter=Invert}">
+              <Border Background="{DynamicResource SurfaceBrush}" IsVisible="{Binding ShowScanEmptyState}">
                 <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
-                  <TextBlock Text="尚未扫描" FontSize="17" FontWeight="SemiBold" HorizontalAlignment="Center"/>
-                  <TextBlock Text="扫描后将在此显示 Cursor 数据文件。扫描不会修改任何文件。" Classes="muted" Margin="0,6,0,0" TextWrapping="Wrap"/>
+                  <TextBlock Text="正在准备扫描" FontSize="17" FontWeight="SemiBold" HorizontalAlignment="Center"/>
+                  <TextBlock Text="启动后会自动扫描 Cursor 占用。扫描不会修改任何文件。" Classes="muted" Margin="0,6,0,0" TextWrapping="Wrap"/>
                 </StackPanel>
               </Border>
               <Border Background="{DynamicResource SurfaceBrush}" IsVisible="{Binding IsScanFilterEmpty}">
@@ -212,7 +249,7 @@
                   <DataGridTextColumn Header="项目" Binding="{Binding ProjectName}" Width="*"/>
                   <DataGridTextColumn Header="来源" Binding="{Binding Source, Converter={StaticResource SessionSourceConverter}}" Width="90"/>
                   <DataGridTextColumn Header="本地时间" Binding="{Binding LastWriteTimeUtc, Converter={StaticResource UtcToLocalTimeConverter}}" Width="145"/>
-                  <DataGridTextColumn Header="大小" Binding="{Binding Size, Converter={StaticResource ByteSizeConverter}}" Width="100"/>
+                  <DataGridTextColumn Header="大小" Binding="{Binding DisplaySizeText}" Width="100"/>
                   <DataGridTextColumn Header="路径" Binding="{Binding DisplayPath}" Width="2*"/>
                 </DataGrid.Columns>
                 <DataGrid.ContextMenu>
@@ -349,7 +386,7 @@
                 <TextBlock Text="{Binding PreviewFiles, StringFormat=文件 {0:N0}}" Margin="0,8,0,0"/>
                 <TextBlock Text="{Binding PreviewWorkspaces, StringFormat=工作区 {0:N0}}"/>
                 <TextBlock Text="{Binding PreviewSessions, StringFormat=会话 {0:N0}}"/>
-                <TextBlock Text="{Binding PreviewBytes, Converter={StaticResource ByteSizeConverter}, StringFormat=预计释放 {0}}"/>
+                <TextBlock Text="{Binding PreviewBytes, Converter={StaticResource ByteSizeConverter}, StringFormat=可从 Cursor 数据中移除 {0}}"/>
                 <TextBlock Text="{Binding RecycleBinModeLabel, StringFormat=删除模式：{0}}" Classes="muted" Margin="0,8,0,0" IsVisible="{Binding UseRecycleBin}"/>
                 <TextBlock Text="删除模式：永久删除" Classes="muted" Margin="0,8,0,0" IsVisible="{Binding UseRecycleBin, Converter={StaticResource BoolVisibilityConverter}, ConverterParameter=Invert}"/>
                 <TextBlock Text="{Binding OperationStatus}" Foreground="{Binding OperationStatusSeverity, Converter={StaticResource StatusBrushConverter}}" TextWrapping="Wrap" Margin="0,8,0,0"/>
@@ -406,8 +443,14 @@
               <TextBlock Text="{Binding SqliteAfter, Converter={StaticResource ByteSizeConverter}, StringFormat=维护后 {0}}" Classes="muted"/>
               <TextBlock Text="{Binding SqliteReclaimed, Converter={StaticResource ByteSizeConverter}, StringFormat=回收 {0}}" Classes="muted"/>
               <TextBlock Text="{Binding SqliteBackupPath, StringFormat=备份 {0}}" Classes="muted" TextTrimming="CharacterEllipsis"/>
+              <TextBlock Text="{Binding SqliteBackupUsageText}" Classes="muted" TextWrapping="Wrap" Margin="0,8,0,0"/>
+              <TextBlock Text="{Binding SqliteBackupCleanupStatus}" Foreground="{Binding SqliteBackupCleanupStatusSeverity, Converter={StaticResource StatusBrushConverter}}" TextWrapping="Wrap"/>
             </StackPanel>
-            <Button Grid.Column="1" Classes="primary" Content="检查、备份并优化" Command="{Binding VacuumCommand}" VerticalAlignment="Center"/>
+            <StackPanel Grid.Column="1" Spacing="8" VerticalAlignment="Center">
+              <Button Classes="primary" Content="检查、备份并优化" Command="{Binding VacuumCommand}"/>
+              <Button Content="打开备份目录" Command="{Binding OpenSqliteBackupDirectoryCommand}"/>
+              <Button Content="删除旧时间戳备份" Command="{Binding CleanupLegacySqliteBackupsCommand}"/>
+            </StackPanel>
           </Grid>
         </Grid>
 
@@ -454,9 +497,9 @@
                   <TextBlock Text="高级功能" Classes="sectionHeader"/>
                   <StackPanel Grid.Column="1">
                     <CheckBox Content="显示高级功能" IsChecked="{Binding AdvancedFeaturesEnabled, Mode=TwoWay}"/>
-                    <TextBlock Text="开启后显示工作区和空间分析页，可按保留期生成批量清理预览。" Classes="muted" TextWrapping="Wrap" Margin="22,0,0,8"/>
+                    <TextBlock Text="开启后显示工作区和空间分析页。默认首页已可按 7/30/90 天清理旧会话，无需打开此开关。" Classes="muted" TextWrapping="Wrap" Margin="22,0,0,8"/>
                     <CheckBox Content="启用 SQLite 高级工具" IsChecked="{Binding AdvancedToolsEnabled, Mode=TwoWay}"/>
-                    <TextBlock Text="开启后显示高级工具页，可对已批准根内的数据库执行检查、备份和 VACUUM。" Classes="muted" TextWrapping="Wrap" Margin="22,0,0,0"/>
+                    <TextBlock Text="开启后显示高级工具页，可选择具体数据库并维护备份。清理 SQLite 记录后，首页也会提供可选的数据库优化。" Classes="muted" TextWrapping="Wrap" Margin="22,0,0,0"/>
                   </StackPanel>
                 </Grid>
               </Border>

@@ -92,6 +92,38 @@ public sealed class OperationServiceTests
     }
 
     [TestMethod]
+    public async Task Backup_CleanupLegacySqliteLeavesRollingAndFileBackups()
+    {
+        using var temp = new TemporaryDirectory();
+        var backupRoot = Path.Combine(temp.Path, "backups");
+        var log = new LogService(Path.Combine(temp.Path, "logs"));
+        var backup = new BackupService(log, backupRoot);
+        var legacy = Path.Combine(backupRoot, "2026-08-20_120000");
+        Directory.CreateDirectory(legacy);
+        await File.WriteAllTextAsync(Path.Combine(legacy, "state.vscdb"), "legacy-sqlite");
+        var fileSession = Path.Combine(backupRoot, "2026-08-20_130000");
+        Directory.CreateDirectory(Path.Combine(fileSession, "files"));
+        await File.WriteAllTextAsync(Path.Combine(fileSession, "manifest.json"), "{}");
+        await File.WriteAllTextAsync(Path.Combine(fileSession, "files", "item.json"), "session");
+        var rolling = Path.Combine(backupRoot, BackupService.SqliteFolderName, "state.vscdb_ABC");
+        Directory.CreateDirectory(rolling);
+        await File.WriteAllTextAsync(Path.Combine(rolling, BackupService.CurrentFileName), "current");
+
+        var usage = backup.GetSqliteBackupUsage();
+        Assert.AreEqual(1, usage.LegacyDirectoryCount);
+        Assert.AreEqual(1, usage.RollingDatabaseCount);
+
+        var result = await backup.CleanupLegacySqliteBackupsAsync();
+
+        Assert.IsTrue(result.Succeeded, result.Error);
+        Assert.AreEqual(1, result.DeletedDirectories);
+        Assert.IsFalse(Directory.Exists(legacy));
+        Assert.IsTrue(File.Exists(Path.Combine(fileSession, "files", "item.json")));
+        Assert.IsTrue(File.Exists(Path.Combine(rolling, BackupService.CurrentFileName)));
+        Assert.AreEqual(0, backup.GetSqliteBackupUsage().LegacyDirectoryCount);
+    }
+
+    [TestMethod]
     public async Task Cleanup_FileChangeBlocksDeletion()
     {
         using var temp = new TemporaryDirectory();
@@ -270,6 +302,38 @@ public sealed class OperationServiceTests
     }
 
     [TestMethod]
+    public async Task Cleanup_FailedBackupWithCopiedFilesDoesNotDelete()
+    {
+        using var temp = new TemporaryDirectory();
+        var root = CreateRoot(temp.Path);
+        var item = CreateFileItem(root, "workspaceStorage/one.json", DataCategory.Workspace, DateTime.UtcNow.AddDays(-2));
+        var recycle = new FakeRecycleBinService(deleteOnSuccess: true);
+        var backup = new FakeBackupService
+        {
+            ResultFactory = items =>
+            {
+                var snapshots = items.ToArray();
+                var results = snapshots.Select(planItem => new BackupItemResult(
+                    planItem.FullPath, "fake-backup", planItem.Size, planItem.LastWriteTimeUtc, true, null)).ToArray();
+                return new BackupOperationResult(false, "fake", results.Sum(result => result.Size), results, "Manifest creation failed.");
+            }
+        };
+        var log = new LogService(Path.Combine(temp.Path, "logs"));
+        var service = new CleanupService(new FakeProcessService(false), new PathGuard([root.Path]), backup, recycle, log);
+
+        var result = await service.ExecuteAsync(
+            new CleanupPlan(Guid.NewGuid(), DateTime.UtcNow, [ToPlanItem(item)]),
+            true,
+            new CleanupOptions(true));
+
+        Assert.IsTrue(result.Blocked);
+        StringAssert.Contains(result.Error!, "Manifest");
+        Assert.IsTrue(File.Exists(item.FullPath));
+        Assert.AreEqual(0, recycle.Calls);
+        Assert.AreEqual(1, backup.Calls);
+    }
+
+    [TestMethod]
     public async Task Cleanup_AutomaticBackupUsesOneSessionForTheEntirePlan()
     {
         using var temp = new TemporaryDirectory();
@@ -388,30 +452,55 @@ public sealed class OperationServiceTests
     private sealed class FakeProcessService(bool running) : IProcessService
     {
         public bool IsCursorRunning() => running;
+        public Task<StopCursorResult> StopCursorAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult(new StopCursorResult(true, running, running ? 1 : 0, null));
     }
 
     private sealed class MutableProcessService : IProcessService
     {
         public bool Running { get; set; }
         public bool IsCursorRunning() => Running;
+        public Task<StopCursorResult> StopCursorAsync(CancellationToken cancellationToken = default)
+        {
+            var wasRunning = Running;
+            Running = false;
+            return Task.FromResult(new StopCursorResult(true, wasRunning, wasRunning ? 1 : 0, null));
+        }
     }
 
     private sealed class FakeBackupService : IBackupService
     {
         public int Calls { get; private set; }
         public int LastItemCount { get; private set; }
+        public string BackupRootPath => "fake";
+        public Func<IReadOnlyList<CleanupPlanItem>, BackupOperationResult>? ResultFactory { get; set; }
 
         public Task<BackupOperationResult> BackupAsync(IEnumerable<CleanupPlanItem> items, CancellationToken cancellationToken = default)
         {
             var snapshots = items.ToArray();
             Calls++;
             LastItemCount = snapshots.Length;
+            if (ResultFactory is not null)
+            {
+                return Task.FromResult(ResultFactory(snapshots));
+            }
+
             var results = snapshots.Select(item => new BackupItemResult(
                 item.FullPath, "fake-backup", item.Size, item.LastWriteTimeUtc, true, null)).ToArray();
             return Task.FromResult(new BackupOperationResult(true, "fake", results.Sum(item => item.Size), results));
         }
 
         public Task<string> CreateSqliteBackupPathAsync(string databasePath, CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+
+        public Task<string> CommitSqliteBackupAsync(string stagingPath, CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+
+        public void EnsureVolumeFreeSpace(string pathOnVolume, long requiredBytes, string operationLabel) { }
+
+        public SqliteBackupUsage GetSqliteBackupUsage() => new("fake", 0, 0, 0, 0);
+
+        public Task<SqliteBackupCleanupResult> CleanupLegacySqliteBackupsAsync(CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
     }
 

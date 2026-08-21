@@ -37,6 +37,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private readonly ICleanupService _cleanup;
     private readonly IShellService _shell;
     private readonly ISqliteService _sqlite;
+    private readonly IBackupService _backup;
     private readonly IDialogService _dialogs;
     private readonly ISessionContentService _sessionContent;
     private readonly IThemeService _theme;
@@ -57,6 +58,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private bool _closeRequested;
     private bool _isVacuuming;
     private bool _isCleaning;
+    private bool _isStoppingCursor;
     private bool _isScopeRefreshing;
     private long _settingsVersion;
     private long _scopeGeneration;
@@ -86,10 +88,18 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private long _sqliteBefore;
     private long _sqliteAfter;
     private string? _sqliteBackupPath;
+    private string _sqliteBackupUsageText = "尚未统计 SQLite 备份占用";
+    private string _sqliteBackupCleanupStatus = string.Empty;
+    private StatusSeverity _sqliteBackupCleanupStatusSeverity;
     private int _previewFiles;
     private int _previewWorkspaces;
     private int _previewSessions;
     private long _previewBytes;
+    private int _staleSessionCount;
+    private int _staleSessionFileCount;
+    private int _staleConversationIdCount;
+    private long _staleSessionBytes;
+    private bool _suggestDatabaseOptimize;
     private int _cleanedFiles;
     private long _cleanedBytes;
     private long _currentUsage;
@@ -117,7 +127,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         IScanResultStore store, IProcessService process, ILogService log,
         ISettingsService settingsService, ICleanupPlannerService planner,
         ICleanupService cleanup, IShellService shell, ISqliteService sqlite,
-        IDialogService dialogs, ISessionContentService sessionContent, IThemeService theme)
+        IDialogService dialogs, ISessionContentService sessionContent, IThemeService theme,
+        IBackupService backup)
     {
         _pathService = pathService;
         _scanner = scanner;
@@ -131,6 +142,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _cleanup = cleanup;
         _shell = shell;
         _sqlite = sqlite;
+        _backup = backup;
         _dialogs = dialogs;
         _sessionContent = sessionContent;
         _theme = theme;
@@ -143,16 +155,26 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         DeleteSelectedSessionsCommand = new AsyncRelayCommand(
             (parameter, token) => TrackActivityAsync(() => DeleteSelectedSessionsAsync(parameter, token)),
             parameter => CanPreview && HasSelectedSessions(parameter) && !IsCleaning);
+        CleanupStaleSessionsCommand = new AsyncRelayCommand(
+            token => TrackActivityAsync(() => CleanupStaleSessionsAsync(token)),
+            () => CanCleanupStaleSessions);
         CleanupCommand = new AsyncRelayCommand(token => TrackActivityAsync(() => CleanupAsync(token)), () => _cleanupPlan?.FileCount > 0 && !IsBusy && !IsScanning && !_closeRequested);
         CancelCleanupCommand = new RelayCommand(() =>
         {
             CleanupCommand.Cancel();
             DeleteSelectedSessionsCommand.Cancel();
+            CleanupStaleSessionsCommand.Cancel();
         }, () => IsCleaning);
         VacuumCommand = new AsyncRelayCommand(token => TrackActivityAsync(() => VacuumAsync(token)), () => SelectedDatabase is not null && AdvancedToolsEnabled && !IsBusy && !IsScanning && !_closeRequested);
+        OptimizeSuggestedDatabaseCommand = new AsyncRelayCommand(
+            token => TrackActivityAsync(() => VacuumAsync(token)),
+            () => SuggestDatabaseOptimize && SelectedDatabase is not null && !IsBusy && !IsScanning && !_closeRequested);
         OpenDirectoryCommand = new RelayCommand(OpenDirectory);
         OpenLogsCommand = new RelayCommand(() => TryShell(_shell.OpenLogs));
         OpenDataDirectoryCommand = new RelayCommand(() => TryShell(() => _shell.OpenDirectory(Path.GetDirectoryName(_settingsService.SettingsPath)!)));
+        OpenSqliteBackupDirectoryCommand = new RelayCommand(() => TryShell(() => _shell.OpenDirectory(_backup.BackupRootPath)), () => AdvancedToolsEnabled && !_closeRequested);
+        CleanupLegacySqliteBackupsCommand = new AsyncRelayCommand(token => TrackActivityAsync(() => CleanupLegacySqliteBackupsAsync(token)), () => AdvancedToolsEnabled && !IsBusy && !IsScanning && !_closeRequested);
+        StopCursorCommand = new AsyncRelayCommand(token => TrackActivityAsync(() => StopCursorAsync(token)), () => CanStopCursor);
         SaveSettingsCommand = new AsyncRelayCommand(token => TrackActivityAsync(() => SaveSettingsAsync(token)), () => IsSettingsDirty && !IsBusy && !IsScanning && !_closeRequested);
     }
 
@@ -181,18 +203,47 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public RelayCommand GeneratePreviewCommand { get; }
     public RelayCommand GenerateSelectedWorkspacePreviewCommand { get; }
     public AsyncRelayCommand DeleteSelectedSessionsCommand { get; }
+    public AsyncRelayCommand CleanupStaleSessionsCommand { get; }
     public AsyncRelayCommand CleanupCommand { get; }
     public RelayCommand CancelCleanupCommand { get; }
     public AsyncRelayCommand VacuumCommand { get; }
+    public AsyncRelayCommand OptimizeSuggestedDatabaseCommand { get; }
     public RelayCommand OpenDirectoryCommand { get; }
     public RelayCommand OpenLogsCommand { get; }
     public RelayCommand OpenDataDirectoryCommand { get; }
+    public RelayCommand OpenSqliteBackupDirectoryCommand { get; }
+    public AsyncRelayCommand CleanupLegacySqliteBackupsCommand { get; }
+    public AsyncRelayCommand StopCursorCommand { get; }
     public AsyncRelayCommand SaveSettingsCommand { get; }
 
     public int SelectedPage { get => _selectedPage; set => SetProperty(ref _selectedPage, value); }
-    public bool IsScanning { get => _isScanning; private set { if (SetProperty(ref _isScanning, value)) { OnPropertyChanged(nameof(IsProgressVisible)); RaiseCommands(); } } }
-    public bool IsBusy { get => _isBusy; private set { if (SetProperty(ref _isBusy, value)) { OnPropertyChanged(nameof(CanEditTargets)); RaiseCommands(); } } }
-    public bool IsCleaning { get => _isCleaning; private set { if (SetProperty(ref _isCleaning, value)) CancelCleanupCommand.NotifyCanExecuteChanged(); } }
+    public bool IsScanning { get => _isScanning; private set { if (SetProperty(ref _isScanning, value)) { OnPropertyChanged(nameof(IsProgressVisible)); OnPropertyChanged(nameof(ShowScanEmptyState)); OnPropertyChanged(nameof(CanStopCursor)); RaiseCommands(); } } }
+    public bool IsBusy { get => _isBusy; private set { if (SetProperty(ref _isBusy, value)) { OnPropertyChanged(nameof(CanEditTargets)); OnPropertyChanged(nameof(CanStopCursor)); RaiseCommands(); } } }
+    public bool IsCleaning
+    {
+        get => _isCleaning;
+        private set
+        {
+            if (!SetProperty(ref _isCleaning, value)) return;
+            OnPropertyChanged(nameof(CanCleanupStaleSessions));
+            CancelCleanupCommand.NotifyCanExecuteChanged();
+            CleanupStaleSessionsCommand.NotifyCanExecuteChanged();
+            DeleteSelectedSessionsCommand.NotifyCanExecuteChanged();
+        }
+    }
+    public bool IsStoppingCursor
+    {
+        get => _isStoppingCursor;
+        private set
+        {
+            if (SetProperty(ref _isStoppingCursor, value))
+            {
+                OnPropertyChanged(nameof(CanStopCursor));
+                OnPropertyChanged(nameof(CursorStateText));
+                StopCursorCommand.NotifyCanExecuteChanged();
+            }
+        }
+    }
     public bool IsScopeRefreshing { get => _isScopeRefreshing; private set => SetProperty(ref _isScopeRefreshing, value); }
     public string BusyText { get => _busyText; private set => SetProperty(ref _busyText, value); }
     public bool CanEditTargets => !IsBusy;
@@ -207,7 +258,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public string DataDirectory => string.Join("  |  ", _pathService.GetDataRoots().Select(r => r.Path));
     public string ScopeNotice => "扫描器会读取全部 Cursor 数据根；以下范围仅筛选显示内容和清理计划。";
     public bool IsCursorRunning => _process.IsCursorRunning();
-    public string CursorStateText => IsCursorRunning ? "Cursor 正在运行：可扫描，但清理和数据库维护将被阻止" : "Cursor 未运行";
+    public bool CanStopCursor => IsCursorRunning && !IsStoppingCursor && !IsBusy && !IsScanning && !_closeRequested;
+    public string CursorStateText => IsStoppingCursor
+        ? "正在停止 Cursor…"
+        : IsCursorRunning
+            ? "Cursor 正在运行：可扫描，但清理和数据库维护将被阻止"
+            : "Cursor 未运行";
     public StatusSeverity CursorStatusSeverity { get => _cursorStatusSeverity; private set => SetProperty(ref _cursorStatusSeverity, value); }
     public string ClosingStatus { get => _closingStatus; private set { if (SetProperty(ref _closingStatus, value)) OnPropertyChanged(nameof(IsClosing)); } }
     public bool IsClosing => !string.IsNullOrWhiteSpace(ClosingStatus);
@@ -219,6 +275,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public string WorkspaceSearch { get => _workspaceSearch; set { if (SetProperty(ref _workspaceSearch, value)) DebounceRefresh(RefreshWorkspaceFilter, isWorkspace: true); } }
 
     public bool HasScanResult => _scanResult is not null;
+    public bool ShowScanEmptyState => !HasScanResult && !IsScanning;
     public int ScanVisibleCount { get => _scanVisibleCount; private set { if (SetProperty(ref _scanVisibleCount, value)) OnPropertyChanged(nameof(IsScanFilterEmpty)); } }
     public int SessionVisibleCount { get => _sessionVisibleCount; private set { if (SetProperty(ref _sessionVisibleCount, value)) OnPropertyChanged(nameof(IsSessionFilterEmpty)); } }
     public int WorkspaceVisibleCount { get => _workspaceVisibleCount; private set { if (SetProperty(ref _workspaceVisibleCount, value)) OnPropertyChanged(nameof(IsWorkspaceFilterEmpty)); } }
@@ -248,8 +305,28 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             if (!SetProperty(ref _retentionDays, value)) return;
             _settings.RetentionDays = value;
             if (!_loadingSettings) MarkSettingsDirty();
+            OnPropertyChanged(nameof(UseRetention7));
+            OnPropertyChanged(nameof(UseRetention30));
+            OnPropertyChanged(nameof(UseRetention90));
+            OnPropertyChanged(nameof(CleanupRetentionButtonText));
             InvalidatePreview("保留策略已更改，请重新生成预览");
+            RefreshStaleCleanupSummary();
         }
+    }
+    public bool UseRetention7
+    {
+        get => RetentionDays == 7;
+        set { if (value) RetentionDays = 7; }
+    }
+    public bool UseRetention30
+    {
+        get => RetentionDays == 30;
+        set { if (value) RetentionDays = 30; }
+    }
+    public bool UseRetention90
+    {
+        get => RetentionDays == 90;
+        set { if (value) RetentionDays = 90; }
     }
     public CleanupPolicyMode CleanupPolicyMode { get => _cleanupPolicyMode; set { if (SetProperty(ref _cleanupPolicyMode, value)) { OnPropertyChanged(nameof(IsRetentionPolicy)); OnPropertyChanged(nameof(IsCutoffPolicy)); InvalidatePreview("清理策略已更改，请重新生成预览"); } } }
     public bool IsRetentionPolicy
@@ -275,14 +352,72 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public long CurrentUsage { get => _currentUsage; private set => SetProperty(ref _currentUsage, value); }
     public bool CanPreview => _scanResult is not null && !IsScanning && !IsBusy && !_closeRequested;
     public bool HasCleanupPlan => _cleanupPlan?.FileCount > 0;
+    public int StaleSessionCount { get => _staleSessionCount; private set => SetProperty(ref _staleSessionCount, value); }
+    public int StaleSessionFileCount { get => _staleSessionFileCount; private set => SetProperty(ref _staleSessionFileCount, value); }
+    public int StaleConversationIdCount { get => _staleConversationIdCount; private set => SetProperty(ref _staleConversationIdCount, value); }
+    public long StaleSessionBytes { get => _staleSessionBytes; private set => SetProperty(ref _staleSessionBytes, value); }
+    public bool HasStaleSessions => StaleSessionCount > 0;
+    public bool CanCleanupStaleSessions => CanPreview && HasStaleSessions && !IsCleaning;
+    public string CleanupRetentionButtonText => $"清理 {RetentionDays} 天前的数据";
+    public string StaleCleanupSummaryText
+    {
+        get
+        {
+            if (!HasScanResult)
+            {
+                return "启动后将自动扫描 Cursor 占用，并按保留时间列出可清理的旧会话。";
+            }
 
-    public ScanItem? SelectedDatabase { get => _selectedDatabase; set { if (IsBusy) return; if (SetProperty(ref _selectedDatabase, value)) { SqliteStatus = value is null ? "请选择数据库" : "只读检查就绪；执行时将先备份"; SqliteStatusSeverity = StatusSeverity.Normal; VacuumCommand.NotifyCanExecuteChanged(); } } }
+            if (!HasStaleSessions)
+            {
+                return $"{RetentionDays} 天前没有可清理的旧会话。工作区、SQLite 文件和其他缓存不纳入一键清理。";
+            }
+
+            var summary = $"{RetentionDays} 天前：{StaleSessionCount:N0} 个会话 · {StaleSessionFileCount:N0} 个文件 · 可从 Cursor 数据中移除 {ByteSizeFormatter.Format(StaleSessionBytes)}";
+            if (StaleConversationIdCount > 0)
+            {
+                summary += $" · {StaleConversationIdCount:N0} 个数据库会话 ID";
+            }
+
+            return summary;
+        }
+    }
+    public bool SuggestDatabaseOptimize
+    {
+        get => _suggestDatabaseOptimize;
+        private set
+        {
+            if (SetProperty(ref _suggestDatabaseOptimize, value))
+            {
+                OptimizeSuggestedDatabaseCommand.NotifyCanExecuteChanged();
+            }
+        }
+    }
+
+    public ScanItem? SelectedDatabase
+    {
+        get => _selectedDatabase;
+        set
+        {
+            if (IsBusy) return;
+            if (SetProperty(ref _selectedDatabase, value))
+            {
+                SqliteStatus = value is null ? "请选择数据库" : "只读检查就绪；执行时将先备份";
+                SqliteStatusSeverity = StatusSeverity.Normal;
+                VacuumCommand.NotifyCanExecuteChanged();
+                OptimizeSuggestedDatabaseCommand.NotifyCanExecuteChanged();
+            }
+        }
+    }
     public string SqliteStatus { get => _sqliteStatus; private set => SetProperty(ref _sqliteStatus, value); }
     public StatusSeverity SqliteStatusSeverity { get => _sqliteStatusSeverity; private set => SetProperty(ref _sqliteStatusSeverity, value); }
     public long SqliteBefore { get => _sqliteBefore; private set => SetProperty(ref _sqliteBefore, value); }
     public long SqliteAfter { get => _sqliteAfter; private set => SetProperty(ref _sqliteAfter, value); }
     public long SqliteReclaimed => Math.Max(0, SqliteBefore - SqliteAfter);
     public string? SqliteBackupPath { get => _sqliteBackupPath; private set => SetProperty(ref _sqliteBackupPath, value); }
+    public string SqliteBackupUsageText { get => _sqliteBackupUsageText; private set => SetProperty(ref _sqliteBackupUsageText, value); }
+    public string SqliteBackupCleanupStatus { get => _sqliteBackupCleanupStatus; private set => SetProperty(ref _sqliteBackupCleanupStatus, value); }
+    public StatusSeverity SqliteBackupCleanupStatusSeverity { get => _sqliteBackupCleanupStatusSeverity; private set => SetProperty(ref _sqliteBackupCleanupStatusSeverity, value); }
 
     public bool AutomaticBackup { get => _settings.AutomaticBackup; set { if (_settings.AutomaticBackup != value) { _settings.AutomaticBackup = value; SettingsChanged(nameof(AutomaticBackup)); } } }
     public bool UseRecycleBin { get => _settings.UseRecycleBin; set { if (_settings.UseRecycleBin != value) { _settings.UseRecycleBin = value; SettingsChanged(nameof(UseRecycleBin)); } } }
@@ -311,6 +446,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             OnPropertyChanged(nameof(AdvancedToolsDisabled));
             if (!value && SelectedPage == 4) SelectedPage = 5;
             VacuumCommand.NotifyCanExecuteChanged();
+            OpenSqliteBackupDirectoryCommand.NotifyCanExecuteChanged();
+            CleanupLegacySqliteBackupsCommand.NotifyCanExecuteChanged();
         }
     }
     public bool AdvancedToolsDisabled => !AdvancedToolsEnabled;
@@ -340,10 +477,16 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             OnPropertyChanged(nameof(SettingsStatus));
             OnPropertyChanged(nameof(DataDirectory));
             RefreshCursorState();
+            RefreshSqliteBackupUsage();
         }
         catch (OperationCanceledException) when (_lifetimeCancellation.IsCancellationRequested) { }
         catch (Exception ex) { await ReportErrorAsync("settings.initialize", "加载设置失败", ex); }
         finally { _loadingSettings = false; }
+
+        if (!_closeRequested && !_lifetimeCancellation.IsCancellationRequested)
+        {
+            await ScanAsync(_lifetimeCancellation.Token);
+        }
     }
 
     private async Task ScanAsync(CancellationToken commandToken)
@@ -466,11 +609,13 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             _store.Set(fullResult);
             _scanResult = fullResult;
             OnPropertyChanged(nameof(HasScanResult));
+            OnPropertyChanged(nameof(ShowScanEmptyState));
             OnPropertyChanged(nameof(IsScanFilterEmpty));
             OnPropertyChanged(nameof(IsSessionFilterEmpty));
             OnPropertyChanged(nameof(IsWorkspaceFilterEmpty));
         }
         ResetSessionPreview("扫描结果已更新，请重新选择会话预览内容");
+        RefreshStaleCleanupSummary();
         RaiseCommands();
     }
 
@@ -505,11 +650,22 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         catch (Exception ex) { InvalidatePreview($"无法生成预览：{ex.Message}"); }
     }
 
-    private async Task DeleteSelectedSessionsAsync(object? parameter, CancellationToken token)
+    private Task DeleteSelectedSessionsAsync(object? parameter, CancellationToken token)
+    {
+        var sessions = (parameter as IList)?.OfType<SessionInfo>().ToArray() ?? [];
+        return DeleteSessionsAsync(sessions, token, timeBased: false);
+    }
+
+    private Task CleanupStaleSessionsAsync(CancellationToken token) =>
+        DeleteSessionsAsync(GetStaleSessions(), token, timeBased: true);
+
+    private async Task DeleteSessionsAsync(IReadOnlyList<SessionInfo> selectedSessions, CancellationToken token, bool timeBased)
     {
         if (_scanResult is null) return;
-        var sessions = (parameter as IList)?.OfType<SessionInfo>().ToArray() ?? [];
+        var sessions = timeBased ? GetStaleSessions() : selectedSessions.ToArray();
         if (sessions.Length == 0) return;
+        var blockedTitle = timeBased ? "无法清理旧数据" : "无法删除所选会话";
+        var confirmTitle = timeBased ? $"确认清理 {RetentionDays} 天前的数据" : "确认删除所选会话";
         var filePaths = sessions
             .Select(session => session.FilePath)
             .Where(path => !string.IsNullOrWhiteSpace(path))
@@ -529,9 +685,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             }
             catch (Exception ex)
             {
-                OperationStatus = $"无法删除所选会话：{ex.Message}";
+                OperationStatus = $"{blockedTitle}：{ex.Message}";
                 OperationStatusSeverity = StatusSeverity.Error;
-                if (!_closeRequested) await _dialogs.ShowErrorAsync("无法删除所选会话", ex.Message, token);
+                if (!_closeRequested) await _dialogs.ShowErrorAsync(blockedTitle, ex.Message, token);
                 return;
             }
         }
@@ -539,38 +695,51 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         var fileCount = plan?.FileCount ?? 0;
         if (fileCount == 0 && conversationIds.Length == 0)
         {
-            const string message = "所选会话没有可删除的文件，也没有可匹配的 SQLite 会话 ID。非 UUID 文件不会改数据库。";
+            var message = timeBased
+                ? $"{RetentionDays} 天前没有可清理的旧会话文件，也没有可匹配的 SQLite 会话 ID。"
+                : "所选会话没有可删除的文件，也没有可匹配的 SQLite 会话 ID。非 UUID 文件不会改数据库。";
             OperationStatus = message;
             OperationStatusSeverity = StatusSeverity.Warning;
-            if (!_closeRequested) await _dialogs.ShowErrorAsync("无法删除所选会话", message, token);
+            if (!_closeRequested) await _dialogs.ShowErrorAsync(blockedTitle, message, token);
             return;
         }
 
         if (_process.IsCursorRunning())
         {
-            await _dialogs.ShowErrorAsync("无法删除所选会话", "Cursor 正在运行。请关闭 Cursor 后再删除所选会话。", token);
+            var cursorMessage = timeBased
+                ? "Cursor 正在运行。请关闭 Cursor 后再清理旧会话。"
+                : "Cursor 正在运行。请关闭 Cursor 后再删除所选会话。";
+            await _dialogs.ShowErrorAsync(blockedTitle, cursorMessage, token);
             InvalidatePreview("Cursor 运行中，预览已失效");
             return;
         }
 
         var mode = UseRecycleBin ? DisplayText.RecycleBinModeLabel : "永久删除";
-        var backup = AutomaticBackup ? "会话文件先自动备份" : "会话文件不创建备份";
+        var backup = AutomaticBackup ? "会话文件先自动备份，备份仍占用空间" : "会话文件不创建备份";
+        var recycleLine = UseRecycleBin
+            ? $"文件将进入{mode}。清空后才会释放磁盘空间。"
+            : "将永久删除文件。";
         var sqliteLine = conversationIds.Length == 0
-            ? "所选会话没有可匹配的 SQLite ID，不会修改数据库。"
-            : $"同时删除 SQLite 中 {conversationIds.Length:N0} 个会话 ID 的聊天记录；数据库会先做在线备份（不受文件备份开关影响）。";
+            ? "SQLite：没有可匹配的会话 ID，不会修改数据库。"
+            : $"SQLite：将删除 {conversationIds.Length:N0} 个会话 ID 的聊天记录（删行后数据库文件通常不会立刻变小）。{FormatSqliteBackupNotice(databasePaths)}清理完成后可选择优化数据库以回收库文件空间。";
         var fileLine = fileCount == 0
-            ? "没有可回收的会话文件。"
-            : $"将处理 {fileCount:N0} 个会话文件，预计释放 {ByteSizeFormatter.Format(plan!.TotalSize)}。";
+            ? "会话文件：没有可回收的会话文件。"
+            : $"会话文件：将处理 {fileCount:N0} 个，可从 Cursor 数据中移除 {ByteSizeFormatter.Format(plan!.TotalSize)}。";
+        var scopeLine = timeBased
+            ? $"将清理 {sessions.Length:N0} 个 {RetentionDays} 天前的会话。工作区、SQLite 文件和其他缓存不纳入本次清理。\n"
+            : string.Empty;
         var confirmed = await _dialogs.ConfirmAsync(
-            "确认删除所选会话",
-            $"{fileLine}\n{sqliteLine}\n模式：{backup}，{mode}。\n请保持 Cursor 关闭。此操作只能执行一次，是否继续？",
+            confirmTitle,
+            $"{scopeLine}{fileLine}\n{sqliteLine}\n{recycleLine}\n模式：{backup}。\n请保持 Cursor 关闭。此操作只能执行一次，是否继续？",
             token);
         if (!confirmed) return;
 
         IsBusy = true;
         IsCleaning = true;
-        BusyText = "正在删除所选会话，取消后可能已有部分内容完成处理";
-        OperationStatus = "正在删除所选会话";
+        BusyText = timeBased
+            ? "正在清理旧会话，取消后可能已有部分内容完成处理"
+            : "正在删除所选会话，取消后可能已有部分内容完成处理";
+        OperationStatus = timeBased ? "正在清理旧会话" : "正在删除所选会话";
         OperationStatusSeverity = StatusSeverity.Normal;
         InvalidatePreview("正在执行清理，原预览已失效");
         CleanupOperationResult? fileResult = null;
@@ -579,19 +748,45 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         {
             if (conversationIds.Length > 0)
             {
+                BusyText = "正在逐个处理聊天数据库；取消后将保留已完成库的结果";
                 sqliteResult = await _sqlite.DeleteChatRecordsAsync(conversationIds, databasePaths, GetApprovedRoots(), token);
+                RefreshSqliteBackupUsage();
                 if (sqliteResult.Blocked)
                 {
                     OperationStatus = $"SQLite 聊天删除被阻止：{sqliteResult.Error}";
                     OperationStatusSeverity = StatusSeverity.Error;
                     if (!_closeRequested)
-                        await _dialogs.ShowErrorAsync("无法删除所选会话", sqliteResult.Error ?? "Cursor 运行中，数据库未被修改。", CancellationToken.None);
+                        await _dialogs.ShowErrorAsync(blockedTitle, sqliteResult.Error ?? "Cursor 运行中，数据库未被修改。", CancellationToken.None);
+                    return;
+                }
+
+                // Partial SQLite failure or cancel must not delete session files.
+                if (!sqliteResult.Succeeded || sqliteResult.Cancelled)
+                {
+                    var sqliteOutcome = sqliteResult.Cancelled ? "清理已取消" : "清理未完成";
+                    OperationStatus = ComposeSessionDeleteStatus(sqliteOutcome, null, sqliteResult);
+                    OperationStatusSeverity = StatusSeverity.Warning;
+                    await RescanAfterCleanupAsync(
+                        new CleanupOperationResult(plan?.Id ?? Guid.Empty, false, false, sqliteResult.Cancelled, []),
+                        sqliteResult);
+                    if (!_closeRequested)
+                    {
+                        var detail = sqliteResult.Error ?? "SQLite 未完整成功，已跳过会话文件删除。";
+                        await _dialogs.ShowErrorAsync(
+                            sqliteResult.Cancelled ? "会话删除已取消" : "SQLite 未完整成功",
+                            $"{detail}\n为避免记录与文件不一致，未删除会话文件。",
+                            CancellationToken.None);
+                    }
+
                     return;
                 }
             }
 
             if (fileCount > 0 && plan is not null)
             {
+                BusyText = timeBased
+                    ? "正在清理旧会话文件，取消后可能已有部分内容完成处理"
+                    : "正在删除所选会话文件，取消后可能已有部分内容完成处理";
                 fileResult = await _cleanup.ExecuteAsync(
                     plan,
                     true,
@@ -617,6 +812,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 ? StatusSeverity.Warning
                 : StatusSeverity.Success;
             await RescanAfterCleanupAsync(fileResult ?? new CleanupOperationResult(plan?.Id ?? Guid.Empty, true, false, false, []), sqliteResult);
+            if (sqliteResult is { Succeeded: true, DeletedRows: > 0 })
+            {
+                SuggestDatabaseOptimize = true;
+            }
         }
         catch (OperationCanceledException)
         {
@@ -664,8 +863,14 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             return;
         }
         var mode = UseRecycleBin ? DisplayText.RecycleBinModeLabel : "永久删除";
-        var backup = AutomaticBackup ? "先自动备份" : "不创建备份";
-        var confirmed = await _dialogs.ConfirmAsync(confirmTitle, $"将处理 {plan.FileCount:N0} 个文件，预计释放 {ByteSizeFormatter.Format(plan.TotalSize)}。\n模式：{backup}，{mode}。\n此清理计划只能执行一次，是否继续？", token);
+        var backup = AutomaticBackup ? "先自动备份，备份仍占用空间" : "不创建备份";
+        var recycleLine = UseRecycleBin
+            ? $"文件将进入{mode}。清空后才会释放磁盘空间。"
+            : "将永久删除文件。";
+        var confirmed = await _dialogs.ConfirmAsync(
+            confirmTitle,
+            $"将处理 {plan.FileCount:N0} 个文件，可从 Cursor 数据中移除 {ByteSizeFormatter.Format(plan.TotalSize)}。\n{recycleLine}\n模式：{backup}。\n此清理计划只能执行一次，是否继续？",
+            token);
         if (!confirmed) return;
         IsBusy = true;
         IsCleaning = true;
@@ -681,7 +886,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             var failedFiles = result.Items.Count(item => !item.Succeeded);
             if (result.Blocked)
             {
-                OperationStatus = $"清理被阻止：已删除 {CleanedFiles:N0}，失败 {failedFiles:N0}，释放 {ByteSizeFormatter.Format(CleanedBytes)}；{result.Error}；可打开日志查看详情";
+                OperationStatus = $"清理被阻止：已从 Cursor 数据目录移除 {CleanedFiles:N0}，失败 {failedFiles:N0}，共 {ByteSizeFormatter.Format(CleanedBytes)}；{result.Error}；可打开日志查看详情";
                 OperationStatusSeverity = StatusSeverity.Error;
                 if (result.Items.Count > 0)
                     await RescanAfterCleanupAsync(result);
@@ -690,14 +895,14 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 return;
             }
             OperationStatus = result.Cancelled
-                ? $"清理已取消：已删除 {CleanedFiles:N0}，失败 {failedFiles:N0}，释放 {ByteSizeFormatter.Format(CleanedBytes)}；可能已有部分文件完成处理，可打开日志查看详情"
-                : $"清理完成：已删除 {CleanedFiles:N0}，失败 {failedFiles:N0}，释放 {ByteSizeFormatter.Format(CleanedBytes)}；正在重新扫描";
+                ? $"清理已取消：已从 Cursor 数据目录移除 {CleanedFiles:N0}，失败 {failedFiles:N0}，共 {ByteSizeFormatter.Format(CleanedBytes)}；可能已有部分文件完成处理，可打开日志查看详情"
+                : $"清理完成：已从 Cursor 数据目录移除 {CleanedFiles:N0}，失败 {failedFiles:N0}，共 {ByteSizeFormatter.Format(CleanedBytes)}；正在重新扫描";
             OperationStatusSeverity = result.Cancelled || failedFiles > 0 ? StatusSeverity.Warning : StatusSeverity.Success;
             await RescanAfterCleanupAsync(result);
         }
         catch (OperationCanceledException)
         {
-            OperationStatus = $"清理已取消：已删除 {CleanedFiles:N0}，释放 {ByteSizeFormatter.Format(CleanedBytes)}；可能已有部分文件完成处理，可打开日志查看详情";
+            OperationStatus = $"清理已取消：已从 Cursor 数据目录移除 {CleanedFiles:N0}，共 {ByteSizeFormatter.Format(CleanedBytes)}；可能已有部分文件完成处理，可打开日志查看详情";
             OperationStatusSeverity = StatusSeverity.Warning;
             await RescanAfterCleanupAsync(new CleanupOperationResult(plan.Id, false, false, true, [], "Cleanup was cancelled."));
         }
@@ -750,26 +955,42 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
-    private static string ComposeSessionDeleteStatus(
+    private string ComposeSessionDeleteStatus(
         string outcome,
         CleanupOperationResult? fileResult,
         SqliteChatCleanupResult? sqliteResult)
     {
         var failedFiles = fileResult?.Items.Count(item => !item.Succeeded) ?? 0;
-        var filePart = fileResult is null
+        var filePart = fileResult is null || (fileResult.Items.Count == 0 && fileResult.DeletedFiles == 0)
             ? "未删除会话文件"
-            : $"已删除文件 {fileResult.DeletedFiles:N0}，失败 {failedFiles:N0}，释放 {ByteSizeFormatter.Format(fileResult.ReclaimedBytes)}";
+            : $"已从 Cursor 数据目录移除 {fileResult.DeletedFiles:N0} 个文件，失败 {failedFiles:N0}，共 {ByteSizeFormatter.Format(fileResult.ReclaimedBytes)}";
         var sqlitePart = sqliteResult is null
             ? "未修改 SQLite"
             : sqliteResult.Blocked
                 ? $"SQLite 被阻止：{sqliteResult.Error}"
-                : $"SQLite 删除 {sqliteResult.DeletedRows:N0} 行，失败库 {sqliteResult.FailedDatabases:N0}";
+                : sqliteResult.Cancelled
+                    ? $"SQLite 已取消：删除 {sqliteResult.DeletedRows:N0} 行，已处理库 {sqliteResult.Databases.Count:N0}，失败库 {sqliteResult.FailedDatabases:N0}"
+                    : $"SQLite 删除 {sqliteResult.DeletedRows:N0} 行，失败库 {sqliteResult.FailedDatabases:N0}";
         if (sqliteResult is { Succeeded: false, Error: not null } && !sqliteResult.Blocked)
         {
             sqlitePart += $"：{sqliteResult.Error}";
         }
 
-        return $"{outcome}：{filePart}；{sqlitePart}";
+        var status = $"{outcome}：{filePart}；{sqlitePart}";
+        if (fileResult is { DeletedFiles: > 0 } && UseRecycleBin)
+        {
+            status += "。清空废纸篓后才会释放磁盘空间";
+        }
+        if (fileResult is { DeletedFiles: > 0 } && AutomaticBackup)
+        {
+            status += "。若已创建文件备份，备份仍占用空间";
+        }
+        if (sqliteResult is { Blocked: false, DeletedRows: > 0 })
+        {
+            status += "。数据库文件通常不会立刻变小；可选择优化数据库回收空间。优化后若占用仍高，可能是滚动备份 current 仍占空间";
+        }
+
+        return status;
     }
 
     private async Task VacuumAsync(CancellationToken token)
@@ -777,10 +998,13 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         var database = SelectedDatabase;
         if (database is null) return;
         if (_process.IsCursorRunning()) { await _dialogs.ShowErrorAsync("无法维护数据库", "Cursor 正在运行，SQLite 维护被阻止。", token); return; }
-        var confirmed = await _dialogs.ConfirmAsync("确认 SQLite 维护", $"将对以下数据库执行完整性检查、强制备份和 VACUUM：\n{database.FullPath}\n\n操作期间请保持 Cursor 关闭。", token);
+        var confirmed = await _dialogs.ConfirmAsync(
+            "确认 SQLite 维护",
+            $"将对以下数据库执行完整性检查、强制备份和 VACUUM：\n{database.FullPath}\n{FormatSqliteBackupNotice([database.FullPath], includeSourceVacuumSpace: true)}\nVACUUM 开始后不可取消。操作期间请保持 Cursor 关闭。",
+            token);
         if (!confirmed) return;
         IsBusy = true;
-        BusyText = "正在检查、备份并维护数据库";
+        BusyText = "正在检查、备份并维护数据库；VACUUM 开始后不可取消";
         _isVacuuming = true;
         SqliteStatus = "正在检查、备份并维护数据库";
         SqliteStatusSeverity = StatusSeverity.Normal;
@@ -791,11 +1015,26 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             SqliteAfter = result.SizeAfter;
             OnPropertyChanged(nameof(SqliteReclaimed));
             SqliteBackupPath = result.BackupPath;
-            SqliteStatus = result.Succeeded ? $"维护完成，释放 {ByteSizeFormatter.Format(result.ReclaimedBytes)}" : $"维护失败：{result.Error}";
-            SqliteStatusSeverity = result.Succeeded ? StatusSeverity.Success : StatusSeverity.Error;
-            if (!result.Succeeded && !_closeRequested) await _dialogs.ShowErrorAsync("SQLite 维护失败", result.Error ?? "未知错误", CancellationToken.None);
+            RefreshSqliteBackupUsage();
+            if (result.Succeeded)
+            {
+                SuggestDatabaseOptimize = false;
+                SqliteStatus = $"维护完成，释放 {ByteSizeFormatter.Format(result.ReclaimedBytes)}；备份已更新";
+                SqliteStatusSeverity = StatusSeverity.Success;
+                await RescanAfterVacuumAsync();
+            }
+            else
+            {
+                SqliteStatus = $"维护失败：{result.Error}";
+                SqliteStatusSeverity = StatusSeverity.Error;
+                if (!_closeRequested) await _dialogs.ShowErrorAsync("SQLite 维护失败", result.Error ?? "未知错误", CancellationToken.None);
+            }
         }
-        catch (OperationCanceledException) { SqliteStatus = "数据库维护在 VACUUM 开始前已取消"; SqliteStatusSeverity = StatusSeverity.Warning; }
+        catch (OperationCanceledException)
+        {
+            SqliteStatus = "数据库维护在 VACUUM 开始前已取消；若已生成校验备份将保留";
+            SqliteStatusSeverity = StatusSeverity.Warning;
+        }
         catch (Exception ex)
         {
             SqliteStatus = $"维护失败：{ex.Message}";
@@ -810,6 +1049,128 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             BusyText = string.Empty;
             RaiseCommands();
         }
+    }
+
+    private async Task RescanAfterVacuumAsync()
+    {
+        var token = _lifetimeCancellation.Token;
+        try
+        {
+            token.ThrowIfCancellationRequested();
+            var result = await _scanner.ScanAsync(null, token);
+            var snapshot = await BuildCurrentScopeSnapshotAsync(result, token);
+            token.ThrowIfCancellationRequested();
+            CommitSnapshot(result, snapshot, true);
+            LastScanText = result.CompletedAtUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss");
+        }
+        catch (OperationCanceledException) when (_closeRequested || _lifetimeCancellation.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            await TryLogAsync("error", "ui.sqlite.rescan", ex.Message, ex);
+        }
+    }
+
+    private async Task CleanupLegacySqliteBackupsAsync(CancellationToken token)
+    {
+        var usage = _backup.GetSqliteBackupUsage();
+        if (usage.LegacyDirectoryCount == 0)
+        {
+            SqliteBackupCleanupStatus = "没有可删除的旧时间戳 SQLite 备份。滚动备份 current 不会被删除。";
+            SqliteBackupCleanupStatusSeverity = StatusSeverity.Normal;
+            RefreshSqliteBackupUsage(usage);
+            return;
+        }
+
+        var confirmed = await _dialogs.ConfirmAsync(
+            "确认删除旧 SQLite 备份",
+            $"将删除 {usage.LegacyDirectoryCount:N0} 个旧时间戳 SQLite 备份目录，约 {ByteSizeFormatter.Format(usage.LegacyBytes)}。\n不会删除会话文件备份，也不会删除当前滚动备份 current。是否继续？",
+            token);
+        if (!confirmed) return;
+
+        IsBusy = true;
+        BusyText = "正在删除旧时间戳 SQLite 备份";
+        SqliteBackupCleanupStatus = "正在删除旧时间戳 SQLite 备份";
+        SqliteBackupCleanupStatusSeverity = StatusSeverity.Normal;
+        try
+        {
+            var result = await _backup.CleanupLegacySqliteBackupsAsync(token);
+            RefreshSqliteBackupUsage();
+            SqliteBackupCleanupStatus = result.Succeeded
+                ? $"已删除 {result.DeletedDirectories:N0} 个旧备份目录，释放 {ByteSizeFormatter.Format(result.ReclaimedBytes)}"
+                : $"删除旧备份失败：{result.Error}";
+            SqliteBackupCleanupStatusSeverity = result.Succeeded ? StatusSeverity.Success : StatusSeverity.Error;
+            if (!result.Succeeded && !_closeRequested)
+            {
+                await _dialogs.ShowErrorAsync("删除旧 SQLite 备份失败", result.Error ?? "未知错误", CancellationToken.None);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            SqliteBackupCleanupStatus = "删除旧备份已取消";
+            SqliteBackupCleanupStatusSeverity = StatusSeverity.Warning;
+        }
+        catch (Exception ex)
+        {
+            SqliteBackupCleanupStatus = $"删除旧备份失败：{ex.Message}";
+            SqliteBackupCleanupStatusSeverity = StatusSeverity.Error;
+            if (!_closeRequested) await ReportErrorAsync("ui.sqlite.backup", "删除旧 SQLite 备份失败", ex);
+            else await TryLogAsync("error", "ui.sqlite.backup", ex.Message, ex);
+        }
+        finally
+        {
+            IsBusy = false;
+            BusyText = string.Empty;
+            RaiseCommands();
+        }
+    }
+
+    private void RefreshSqliteBackupUsage(SqliteBackupUsage? usage = null)
+    {
+        try
+        {
+            usage ??= _backup.GetSqliteBackupUsage();
+            var rolling = usage.RollingDatabaseCount == 0
+                ? "滚动备份 0"
+                : $"滚动备份 {usage.RollingDatabaseCount:N0} 个库，{ByteSizeFormatter.Format(usage.RollingBytes)}";
+            var legacy = usage.LegacyDirectoryCount == 0
+                ? "旧时间戳备份 0"
+                : $"旧时间戳备份 {usage.LegacyDirectoryCount:N0} 个目录，{ByteSizeFormatter.Format(usage.LegacyBytes)}";
+            SqliteBackupUsageText = $"{rolling}；{legacy}。目录：{usage.BackupRootPath}";
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            SqliteBackupUsageText = $"无法统计 SQLite 备份占用：{ex.Message}";
+        }
+    }
+
+    private static string FormatSqliteBackupNotice(IEnumerable<string> databasePaths, bool includeSourceVacuumSpace = false)
+    {
+        var sizes = databasePaths
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .Select(PathSafety.Normalize)
+            .Distinct(PathSafety.PathComparer)
+            .Select(path =>
+            {
+                try
+                {
+                    var size = new[] { path, path + "-wal", path + "-shm" }
+                        .Where(File.Exists)
+                        .Sum(candidate => new FileInfo(candidate).Length);
+                    return $"{Path.GetFileName(path)} 约 {ByteSizeFormatter.Format(size)}";
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException)
+                {
+                    return $"{Path.GetFileName(path)} 大小未知";
+                }
+            })
+            .ToArray();
+        var sizeLine = sizes.Length == 0 ? "数据库大小未知" : string.Join("；", sizes);
+        var spaceLine = includeSourceVacuumSpace
+            ? "请确保备份目录所在卷至少有等量空闲空间，且源库所在卷再预留约等量空间供 VACUUM 重写。"
+            : "请确保备份目录所在卷至少有等量空闲空间。";
+        return $"数据库会先做在线备份（不受文件备份开关影响，同一库只保留最新一份）。{sizeLine}。{spaceLine}";
     }
 
     private async Task SaveSettingsAsync(CancellationToken token)
@@ -881,8 +1242,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         CancelScopeRefresh();
         ScanCommand.Cancel();
         CleanupCommand.Cancel();
+        CleanupStaleSessionsCommand.Cancel();
+        DeleteSelectedSessionsCommand.Cancel();
         SaveSettingsCommand.Cancel();
         VacuumCommand.Cancel();
+        OptimizeSuggestedDatabaseCommand.Cancel();
 
         while (true)
         {
@@ -932,6 +1296,30 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             .Select(item => item.FullPath)
             .Distinct(PathSafety.PathComparer)
             .ToArray() ?? [];
+
+    private DateTime GetRetentionCutoffUtc() => DateTime.UtcNow.AddDays(-RetentionDays);
+
+    private SessionInfo[] GetStaleSessions() =>
+        Sessions
+            .Where(session => session.Category is DataCategory.ChatSession or DataCategory.AgentTranscript)
+            .Where(session => session.LastWriteTimeUtc < GetRetentionCutoffUtc())
+            .ToArray();
+
+    private void RefreshStaleCleanupSummary()
+    {
+        var stale = HasScanResult ? GetStaleSessions() : [];
+        StaleSessionCount = stale.Length;
+        StaleSessionFileCount = stale.Count(session => !string.IsNullOrWhiteSpace(session.FilePath));
+        StaleConversationIdCount = stale
+            .SelectMany(session => session.DeletableConversationIds)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Count();
+        StaleSessionBytes = stale.Sum(session => session.Size);
+        OnPropertyChanged(nameof(HasStaleSessions));
+        OnPropertyChanged(nameof(CanCleanupStaleSessions));
+        OnPropertyChanged(nameof(StaleCleanupSummaryText));
+        CleanupStaleSessionsCommand.NotifyCanExecuteChanged();
+    }
     private HashSet<string> GetSelectedWorkspacePaths(IList? selected)
     {
         var prefixes = selected?.OfType<WorkspaceInfo>().Select(w => w.WorkspacePath).ToArray() ?? [];
@@ -1133,15 +1521,99 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     }
     private void NotifyAllSettings()
     {
-        foreach (var property in new[] { nameof(RetentionDays), nameof(AutomaticBackup), nameof(UseRecycleBin), nameof(ScanRoamingData), nameof(ScanLocalData), nameof(ScanUserProfile), nameof(AdvancedFeaturesEnabled), nameof(AdvancedToolsEnabled), nameof(AdvancedToolsDisabled), nameof(Theme) }) OnPropertyChanged(property);
+        foreach (var property in new[] { nameof(RetentionDays), nameof(UseRetention7), nameof(UseRetention30), nameof(UseRetention90), nameof(CleanupRetentionButtonText), nameof(AutomaticBackup), nameof(UseRecycleBin), nameof(ScanRoamingData), nameof(ScanLocalData), nameof(ScanUserProfile), nameof(AdvancedFeaturesEnabled), nameof(AdvancedToolsEnabled), nameof(AdvancedToolsDisabled), nameof(Theme) }) OnPropertyChanged(property);
     }
     private void RefreshCursorState()
     {
         var running = IsCursorRunning;
-        CursorStatusSeverity = running ? StatusSeverity.Warning : StatusSeverity.Success;
+        CursorStatusSeverity = IsStoppingCursor
+            ? StatusSeverity.Warning
+            : running ? StatusSeverity.Warning : StatusSeverity.Success;
         OnPropertyChanged(nameof(IsCursorRunning));
+        OnPropertyChanged(nameof(CanStopCursor));
         OnPropertyChanged(nameof(CursorStateText));
+        StopCursorCommand.NotifyCanExecuteChanged();
     }
+
+    private async Task StopCursorAsync(CancellationToken token)
+    {
+        RefreshCursorState();
+        if (!IsCursorRunning)
+        {
+            OperationStatus = "Cursor 未运行";
+            OperationStatusSeverity = StatusSeverity.Success;
+            return;
+        }
+
+        var confirmed = await _dialogs.ConfirmAsync(
+            "确认强制停止 Cursor",
+            "将结束 Cursor / Cursor Insiders 及其 Helper 进程。未保存的工作可能丢失。是否继续？",
+            token).ConfigureAwait(true);
+        if (!confirmed || _closeRequested)
+        {
+            return;
+        }
+
+        IsBusy = true;
+        IsStoppingCursor = true;
+        BusyText = "正在停止 Cursor…";
+        OperationStatus = "正在停止 Cursor…";
+        OperationStatusSeverity = StatusSeverity.Warning;
+        RefreshCursorState();
+        try
+        {
+            var result = await _process.StopCursorAsync(token).ConfigureAwait(true);
+            await _log.WriteAsync(
+                result.Succeeded ? "info" : "error",
+                "cursor.stop",
+                result.Succeeded
+                    ? result.WasRunning
+                        ? $"Stopped Cursor processes ({result.TerminatedCount})."
+                        : "Cursor was not running."
+                    : result.Error ?? "Failed to stop Cursor.",
+                cancellationToken: token).ConfigureAwait(true);
+
+            RefreshCursorState();
+            if (result.Succeeded && !IsCursorRunning)
+            {
+                OperationStatus = result.WasRunning ? "Cursor 已停止" : "Cursor 未运行";
+                OperationStatusSeverity = StatusSeverity.Success;
+                return;
+            }
+
+            var message = result.Error ?? "Cursor 仍在运行，请手动退出后再清理。";
+            OperationStatus = message;
+            OperationStatusSeverity = StatusSeverity.Error;
+            if (!_closeRequested)
+            {
+                await _dialogs.ShowErrorAsync("无法停止 Cursor", message, token).ConfigureAwait(true);
+            }
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+            OperationStatus = "已取消停止 Cursor";
+            OperationStatusSeverity = StatusSeverity.Warning;
+        }
+        catch (Exception ex)
+        {
+            await _log.WriteAsync("error", "cursor.stop", ex.Message, exception: ex, cancellationToken: CancellationToken.None).ConfigureAwait(true);
+            OperationStatus = ex.Message;
+            OperationStatusSeverity = StatusSeverity.Error;
+            if (!_closeRequested)
+            {
+                await _dialogs.ShowErrorAsync("无法停止 Cursor", ex.Message, token).ConfigureAwait(true);
+            }
+        }
+        finally
+        {
+            IsStoppingCursor = false;
+            IsBusy = false;
+            BusyText = string.Empty;
+            RefreshCursorState();
+            RaiseCommands();
+        }
+    }
+
     private void RaiseCommands()
     {
         ScanCommand.NotifyCanExecuteChanged();
@@ -1149,9 +1621,14 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         GeneratePreviewCommand.NotifyCanExecuteChanged();
         GenerateSelectedWorkspacePreviewCommand.NotifyCanExecuteChanged();
         DeleteSelectedSessionsCommand.NotifyCanExecuteChanged();
+        CleanupStaleSessionsCommand.NotifyCanExecuteChanged();
         CleanupCommand.NotifyCanExecuteChanged();
         CancelCleanupCommand.NotifyCanExecuteChanged();
         VacuumCommand.NotifyCanExecuteChanged();
+        OptimizeSuggestedDatabaseCommand.NotifyCanExecuteChanged();
+        OpenSqliteBackupDirectoryCommand.NotifyCanExecuteChanged();
+        CleanupLegacySqliteBackupsCommand.NotifyCanExecuteChanged();
+        StopCursorCommand.NotifyCanExecuteChanged();
         SaveSettingsCommand.NotifyCanExecuteChanged();
     }
     private void CancelScan() { _scanCancellation?.Cancel(); ScanCommand.Cancel(); }

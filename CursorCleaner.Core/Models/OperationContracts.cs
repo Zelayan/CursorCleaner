@@ -119,15 +119,36 @@ public sealed record SqliteChatCleanupResult(
     bool Succeeded,
     bool Blocked,
     IReadOnlyList<SqliteChatDatabaseResult> Databases,
-    string? Error)
+    string? Error,
+    bool Cancelled = false)
 {
     public int DeletedRows => Databases.Sum(item => item.DeletedRows);
     public int FailedDatabases => Databases.Count(item => !item.Succeeded);
 }
 
+public sealed record SqliteBackupUsage(
+    string BackupRootPath,
+    long RollingBytes,
+    int RollingDatabaseCount,
+    long LegacyBytes,
+    int LegacyDirectoryCount);
+
+public sealed record SqliteBackupCleanupResult(
+    bool Succeeded,
+    int DeletedDirectories,
+    long ReclaimedBytes,
+    string? Error);
+
+public sealed record StopCursorResult(
+    bool Succeeded,
+    bool WasRunning,
+    int TerminatedCount,
+    string? Error);
+
 public interface IProcessService
 {
     bool IsCursorRunning();
+    Task<StopCursorResult> StopCursorAsync(CancellationToken cancellationToken = default);
 }
 
 public interface ILogService
@@ -169,8 +190,16 @@ public interface IThemeService
 
 public interface IBackupService
 {
+    string BackupRootPath { get; }
     Task<BackupOperationResult> BackupAsync(IEnumerable<CleanupPlanItem> items, CancellationToken cancellationToken = default);
     Task<string> CreateSqliteBackupPathAsync(string databasePath, CancellationToken cancellationToken = default);
+    Task<string> CommitSqliteBackupAsync(string stagingPath, CancellationToken cancellationToken = default);
+    /// <summary>
+    /// Fail-closed free-space check on the volume that contains <paramref name="pathOnVolume"/>.
+    /// </summary>
+    void EnsureVolumeFreeSpace(string pathOnVolume, long requiredBytes, string operationLabel);
+    SqliteBackupUsage GetSqliteBackupUsage();
+    Task<SqliteBackupCleanupResult> CleanupLegacySqliteBackupsAsync(CancellationToken cancellationToken = default);
 }
 
 public interface IRecycleBinService

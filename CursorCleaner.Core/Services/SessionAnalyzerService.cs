@@ -1,6 +1,7 @@
 using System.IO;
 using System.Text;
 using System.Text.Json;
+using CursorCleaner.Helpers;
 using CursorCleaner.Models;
 using Microsoft.Data.Sqlite;
 
@@ -121,65 +122,69 @@ public sealed class SessionAnalyzerService : ISessionAnalyzerService
         IReadOnlyList<SessionInfo> fileSessions,
         IReadOnlyList<CursorChatSchema.ComposerRecord> composers)
     {
-        var uniqueComposers = new Dictionary<string, CursorChatSchema.ComposerRecord>(StringComparer.OrdinalIgnoreCase);
+        var uniqueComposers = new Dictionary<string, AggregatedComposer>(StringComparer.OrdinalIgnoreCase);
         foreach (var composer in composers)
         {
             if (uniqueComposers.TryGetValue(composer.ComposerId, out var existing))
             {
-                uniqueComposers[composer.ComposerId] = existing with
-                {
-                    Title = PreferTitle(existing.Title, composer.Title, existing.ProjectName),
-                    ProjectName = existing.ProjectName ?? composer.ProjectName,
-                    LastWriteTimeUtc = existing.LastWriteTimeUtc > composer.LastWriteTimeUtc
-                        ? existing.LastWriteTimeUtc
-                        : composer.LastWriteTimeUtc
-                };
+                uniqueComposers[composer.ComposerId] = existing.MergeWith(composer);
                 continue;
             }
 
-            uniqueComposers[composer.ComposerId] = composer;
+            uniqueComposers[composer.ComposerId] = AggregatedComposer.From(composer);
+        }
+
+        // Index file sessions by deletable conversation IDs for O(1) composer matching.
+        var indexByConversationId = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        for (var i = 0; i < fileSessions.Count; i++)
+        {
+            var session = fileSessions[i];
+            if (SqliteConversationId.IsMatch(session.Id) && !indexByConversationId.ContainsKey(session.Id))
+            {
+                indexByConversationId[session.Id] = i;
+            }
+
+            foreach (var id in session.DeletableConversationIds)
+            {
+                if (!indexByConversationId.ContainsKey(id))
+                {
+                    indexByConversationId[id] = i;
+                }
+            }
         }
 
         var merged = new List<SessionInfo>(fileSessions);
         var claimed = new HashSet<int>();
         foreach (var composer in uniqueComposers.Values)
         {
-            var index = -1;
-            for (var i = 0; i < merged.Count; i++)
-            {
-                if (claimed.Contains(i))
-                {
-                    continue;
-                }
-
-                if (MatchesComposer(merged[i], composer.ComposerId))
-                {
-                    index = i;
-                    break;
-                }
-            }
-
-            if (index >= 0)
+            if (indexByConversationId.TryGetValue(composer.ComposerId, out var index) &&
+                !claimed.Contains(index) &&
+                index >= 0 &&
+                index < merged.Count &&
+                MatchesComposer(merged[index], composer.ComposerId))
             {
                 claimed.Add(index);
                 var existing = merged[index];
                 var ids = existing.DeletableConversationIds.Append(composer.ComposerId)
                     .Distinct(StringComparer.OrdinalIgnoreCase)
                     .ToArray();
+                var databasePaths = MergeDatabasePaths(existing.AllDatabasePaths, composer.DatabasePaths);
                 merged[index] = existing with
                 {
                     Title = PreferTitle(existing.Title, composer.Title, existing.ProjectName),
                     ProjectName = existing.ProjectName ?? composer.ProjectName,
                     Source = SessionSource.Both,
-                    DatabasePath = composer.DatabasePath,
+                    DatabasePath = PreferDatabasePath(existing.DatabasePath, composer.PreferredDatabasePath),
                     ConversationIds = ids,
                     LastWriteTimeUtc = existing.LastWriteTimeUtc > composer.LastWriteTimeUtc
                         ? existing.LastWriteTimeUtc
-                        : composer.LastWriteTimeUtc
+                        : composer.LastWriteTimeUtc,
+                    DatabasePaths = databasePaths
                 };
                 continue;
             }
 
+            var preferred = composer.PreferredDatabasePath;
             merged.Add(new SessionInfo(
                 composer.ComposerId,
                 string.Empty,
@@ -189,8 +194,9 @@ public sealed class SessionAnalyzerService : ISessionAnalyzerService
                 0,
                 composer.LastWriteTimeUtc,
                 SessionSource.Database,
-                composer.DatabasePath,
-                [composer.ComposerId]));
+                preferred,
+                [composer.ComposerId],
+                composer.DatabasePaths));
         }
 
         return merged;
@@ -200,22 +206,135 @@ public sealed class SessionAnalyzerService : ISessionAnalyzerService
         session.Id.Equals(composerId, StringComparison.OrdinalIgnoreCase) ||
         session.DeletableConversationIds.Contains(composerId, StringComparer.OrdinalIgnoreCase);
 
+    private static string PreferDatabasePath(string? current, string? candidate)
+    {
+        if (string.IsNullOrWhiteSpace(current))
+        {
+            return candidate ?? string.Empty;
+        }
+
+        if (string.IsNullOrWhiteSpace(candidate))
+        {
+            return current;
+        }
+
+        return DatabasePathRank(candidate) > DatabasePathRank(current) ? candidate : current;
+    }
+
+    private static IReadOnlyList<string> MergeDatabasePaths(IEnumerable<string>? current, IEnumerable<string>? candidate)
+    {
+        var paths = new List<string>();
+        var seen = new HashSet<string>(PathSafety.PathComparer);
+        void AddRange(IEnumerable<string>? values)
+        {
+            if (values is null)
+            {
+                return;
+            }
+
+            foreach (var value in values)
+            {
+                if (string.IsNullOrWhiteSpace(value))
+                {
+                    continue;
+                }
+
+                var normalized = PathSafety.Normalize(value);
+                if (seen.Add(normalized))
+                {
+                    paths.Add(normalized);
+                }
+            }
+        }
+
+        AddRange(current);
+        AddRange(candidate);
+        if (paths.Count <= 1)
+        {
+            return paths;
+        }
+
+        return paths
+            .OrderByDescending(DatabasePathRank)
+            .ThenBy(path => path, PathSafety.PathComparer)
+            .ToArray();
+    }
+
+    private readonly record struct AggregatedComposer(
+        string ComposerId,
+        string Title,
+        string? ProjectName,
+        DateTime LastWriteTimeUtc,
+        IReadOnlyList<string> DatabasePaths)
+    {
+        public string PreferredDatabasePath =>
+            DatabasePaths.Count == 0
+                ? string.Empty
+                : DatabasePaths
+                    .OrderByDescending(DatabasePathRank)
+                    .ThenBy(path => path, PathSafety.PathComparer)
+                    .First();
+
+        public static AggregatedComposer From(CursorChatSchema.ComposerRecord composer) =>
+            new(
+                composer.ComposerId,
+                composer.Title,
+                composer.ProjectName,
+                composer.LastWriteTimeUtc,
+                string.IsNullOrWhiteSpace(composer.DatabasePath)
+                    ? []
+                    : [PathSafety.Normalize(composer.DatabasePath)]);
+
+        public AggregatedComposer MergeWith(CursorChatSchema.ComposerRecord composer) =>
+            new(
+                ComposerId,
+                PreferTitle(Title, composer.Title, ProjectName),
+                ProjectName ?? composer.ProjectName,
+                LastWriteTimeUtc > composer.LastWriteTimeUtc ? LastWriteTimeUtc : composer.LastWriteTimeUtc,
+                MergeDatabasePaths(DatabasePaths, string.IsNullOrWhiteSpace(composer.DatabasePath) ? null : [composer.DatabasePath]));
+    }
+
+    private static int DatabasePathRank(string path)
+    {
+        var name = Path.GetFileName(path);
+        if (name.Equals("state.vscdb", StringComparison.OrdinalIgnoreCase))
+        {
+            return 3;
+        }
+
+        if (name.Equals("conversation-search.db", StringComparison.OrdinalIgnoreCase))
+        {
+            return 1;
+        }
+
+        return 2;
+    }
+
     private static string PreferTitle(string current, string candidate, string? projectName)
     {
-        if (string.IsNullOrWhiteSpace(current) || current.StartsWith("Cursor session - ", StringComparison.Ordinal))
+        if (string.IsNullOrWhiteSpace(current) || IsGenericSessionTitle(current))
         {
             return candidate;
         }
 
         if (!string.IsNullOrWhiteSpace(projectName) &&
             current.StartsWith(projectName + " - ", StringComparison.Ordinal) &&
-            !candidate.StartsWith(projectName + " - ", StringComparison.Ordinal))
+            !candidate.StartsWith(projectName + " - ", StringComparison.Ordinal) &&
+            !IsGenericSessionTitle(candidate))
         {
             return candidate;
         }
 
+        if (IsGenericSessionTitle(candidate))
+        {
+            return current;
+        }
+
         return current;
     }
+
+    private static bool IsGenericSessionTitle(string title) =>
+        title.StartsWith("Cursor session - ", StringComparison.Ordinal);
 
     private static IReadOnlyList<string>? TryReadConversationIds(string path)
     {

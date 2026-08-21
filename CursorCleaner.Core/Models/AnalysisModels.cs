@@ -1,3 +1,5 @@
+using CursorCleaner.Helpers;
+
 namespace CursorCleaner.Models;
 
 public sealed record WorkspaceInfo(
@@ -27,9 +29,55 @@ public sealed record SessionInfo(
     DateTime LastWriteTimeUtc,
     SessionSource Source = SessionSource.File,
     string? DatabasePath = null,
-    IReadOnlyList<string>? ConversationIds = null)
+    IReadOnlyList<string>? ConversationIds = null,
+    IReadOnlyList<string>? DatabasePaths = null)
 {
     public string DisplayPath => !string.IsNullOrWhiteSpace(FilePath) ? FilePath : DatabasePath ?? string.Empty;
+
+    /// <summary>
+    /// File bytes that can be reclaimed immediately. Database-only sessions show an em dash
+    /// because Size is 0 and does not mean the chat occupies no disk in SQLite.
+    /// </summary>
+    public string DisplaySizeText =>
+        Source == SessionSource.Database && Size <= 0
+            ? "—"
+            : ByteSizeFormatter.Format(Size);
+
+    /// <summary>
+    /// All chat database paths known for this session (preferred path first when present).
+    /// </summary>
+    public IReadOnlyList<string> AllDatabasePaths
+    {
+        get
+        {
+            var paths = new List<string>();
+            var seen = new HashSet<string>(PathSafety.PathComparer);
+            void Add(string? path)
+            {
+                if (string.IsNullOrWhiteSpace(path))
+                {
+                    return;
+                }
+
+                var normalized = PathSafety.Normalize(path);
+                if (seen.Add(normalized))
+                {
+                    paths.Add(normalized);
+                }
+            }
+
+            Add(DatabasePath);
+            if (DatabasePaths is not null)
+            {
+                foreach (var path in DatabasePaths)
+                {
+                    Add(path);
+                }
+            }
+
+            return paths;
+        }
+    }
 
     public IReadOnlyList<string> DeletableConversationIds
     {

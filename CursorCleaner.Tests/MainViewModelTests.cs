@@ -74,6 +74,213 @@ public sealed class MainViewModelTests
     }
 
     [TestMethod]
+    public async Task InitializeAsync_AutoScansAndSummarizesStaleSessions()
+    {
+        await RunStaAsync(async () =>
+        {
+            var root = new CursorDataRoot(Path.GetTempPath(), RootKind.RoamingData, "test");
+            var oldItem = Item(root, "projects/p/old.json", DataCategory.ChatSession, DateTime.UtcNow.AddDays(-40));
+            var recentItem = Item(root, "projects/p/recent.json", DataCategory.ChatSession, DateTime.UtcNow);
+            var workspaceItem = Item(root, "workspaceStorage/w/data.json", DataCategory.Workspace, DateTime.UtcNow.AddDays(-40));
+            var sqliteItem = Item(root, "state.vscdb", DataCategory.SQLite, DateTime.UtcNow.AddDays(-40));
+            var oldSession = new SessionInfo("old", oldItem.FullPath, "旧会话", "p", DataCategory.ChatSession, 10, DateTime.UtcNow.AddDays(-40));
+            var recentSession = new SessionInfo("recent", recentItem.FullPath, "最近会话", "p", DataCategory.ChatSession, 10, DateTime.UtcNow);
+            var scanner = new RecordingScanner(Result(oldItem, recentItem, workspaceItem, sqliteItem), Result(oldItem, recentItem, workspaceItem, sqliteItem));
+            using var viewModel = CreateViewModel(
+                scanner,
+                new ScanResultStore(),
+                new FixedWorkspaceAnalyzer([]),
+                new FixedSessionAnalyzer([oldSession, recentSession]));
+
+            await viewModel.InitializeAsync();
+
+            Assert.AreEqual(1, scanner.ScanCalls);
+            Assert.IsTrue(viewModel.HasScanResult);
+            Assert.AreEqual(30, viewModel.RetentionDays);
+            Assert.IsTrue(viewModel.UseRetention30);
+            Assert.AreEqual(1, viewModel.StaleSessionCount);
+            Assert.AreEqual(1, viewModel.StaleSessionFileCount);
+            Assert.AreEqual(10, viewModel.StaleSessionBytes);
+            StringAssert.Contains(viewModel.StaleCleanupSummaryText, "30 天前");
+            StringAssert.Contains(viewModel.StaleCleanupSummaryText, "可从 Cursor 数据中移除");
+            Assert.AreEqual("清理 30 天前的数据", viewModel.CleanupRetentionButtonText);
+            Assert.IsTrue(viewModel.CleanupStaleSessionsCommand.CanExecute(null));
+            Assert.IsFalse(viewModel.AdvancedFeaturesEnabled);
+
+            viewModel.RetentionDays = 90;
+            Assert.IsFalse(viewModel.HasStaleSessions);
+            Assert.IsFalse(viewModel.CleanupStaleSessionsCommand.CanExecute(null));
+            StringAssert.Contains(viewModel.StaleCleanupSummaryText, "90 天前没有可清理的旧会话");
+
+            viewModel.RetentionDays = 7;
+            Assert.IsTrue(viewModel.HasStaleSessions);
+            Assert.AreEqual("清理 7 天前的数据", viewModel.CleanupRetentionButtonText);
+            Assert.IsTrue(viewModel.CleanupStaleSessionsCommand.CanExecute(null));
+        });
+    }
+
+    [TestMethod]
+    public async Task CleanupStaleSessions_ExcludesWorkspaceAndRequiresConfirmation()
+    {
+        await RunStaAsync(async () =>
+        {
+            var root = new CursorDataRoot(Path.GetTempPath(), RootKind.RoamingData, "test");
+            var oldItem = Item(root, "projects/p/old.json", DataCategory.ChatSession, DateTime.UtcNow.AddDays(-40));
+            var transcriptItem = Item(root, "projects/p/agent-transcripts/run.jsonl", DataCategory.AgentTranscript, DateTime.UtcNow.AddDays(-40));
+            var workspaceItem = Item(root, "workspaceStorage/w/data.json", DataCategory.Workspace, DateTime.UtcNow.AddDays(-40));
+            var sqliteItem = Item(root, "state.vscdb", DataCategory.SQLite, DateTime.UtcNow.AddDays(-40));
+            var otherItem = Item(root, "cache.bin", DataCategory.Other, DateTime.UtcNow.AddDays(-40));
+            var oldSession = new SessionInfo("old", oldItem.FullPath, "旧会话", "p", DataCategory.ChatSession, 10, DateTime.UtcNow.AddDays(-40));
+            var transcript = new SessionInfo("t", transcriptItem.FullPath, "转录", "p", DataCategory.AgentTranscript, 10, DateTime.UtcNow.AddDays(-40));
+            var scanner = new RecordingScanner(Result(oldItem, transcriptItem, workspaceItem, sqliteItem, otherItem), Result(oldItem, transcriptItem, workspaceItem, sqliteItem, otherItem));
+            var cleanup = new RecordingCleanupService();
+            var planner = new CapturingPlanner();
+            var dialogs = new FixedDialogService(true);
+            using var viewModel = CreateViewModel(
+                scanner,
+                new ScanResultStore(),
+                new FixedWorkspaceAnalyzer([]),
+                new FixedSessionAnalyzer([oldSession, transcript]),
+                planner: planner,
+                cleanup: cleanup,
+                dialogs: dialogs);
+
+            await viewModel.ScanForTestingAsync();
+            await viewModel.CleanupStaleSessionsCommand.ExecuteAsync();
+
+            CollectionAssert.AreEquivalent(new[] { oldItem.FullPath, transcriptItem.FullPath }, planner.LastSelectedPaths.ToArray());
+            Assert.IsFalse(planner.LastSelectedPaths.Contains(workspaceItem.FullPath));
+            Assert.IsFalse(planner.LastSelectedPaths.Contains(sqliteItem.FullPath));
+            Assert.IsFalse(planner.LastSelectedPaths.Contains(otherItem.FullPath));
+            StringAssert.Contains(dialogs.LastTitle!, "确认清理 30 天前的数据");
+            StringAssert.Contains(dialogs.LastMessage!, "可从 Cursor 数据中移除");
+            StringAssert.Contains(dialogs.LastMessage!, "工作区、SQLite 文件和其他缓存不纳入本次清理");
+            StringAssert.Contains(dialogs.LastMessage!, "清空后才会释放磁盘空间");
+            Assert.IsTrue(cleanup.LastConfirmed);
+            Assert.AreEqual(2, scanner.ScanCalls);
+        });
+    }
+
+    [TestMethod]
+    public async Task CleanupStaleSessions_CancelConfirmDoesNotWrite()
+    {
+        await RunStaAsync(async () =>
+        {
+            using var temp = new TemporaryDirectory();
+            var rootPath = Path.Combine(temp.Path, "Cursor");
+            Directory.CreateDirectory(rootPath);
+            var oldPath = Path.Combine(rootPath, "old.json");
+            await File.WriteAllTextAsync(oldPath, "session");
+            File.SetLastWriteTimeUtc(oldPath, DateTime.UtcNow.AddDays(-40));
+            var root = new CursorDataRoot(rootPath, RootKind.RoamingData, "test");
+            var oldItem = Item(root, "old.json", DataCategory.ChatSession, DateTime.UtcNow.AddDays(-40));
+            var oldSession = new SessionInfo("old", oldItem.FullPath, "旧会话", "p", DataCategory.ChatSession, 10, DateTime.UtcNow.AddDays(-40));
+            var scanner = new RecordingScanner(Result(oldItem), Result(oldItem));
+            var cleanup = new RecordingCleanupService();
+            var sqlite = new RecordingSqliteService();
+            var dialogs = new FixedDialogService(false);
+            using var viewModel = CreateViewModel(
+                scanner,
+                new ScanResultStore(),
+                new FixedWorkspaceAnalyzer([]),
+                new FixedSessionAnalyzer([oldSession]),
+                cleanup: cleanup,
+                dialogs: dialogs,
+                pathService: new FixedPathService(root),
+                sqlite: sqlite);
+
+            await viewModel.ScanForTestingAsync();
+            await viewModel.CleanupStaleSessionsCommand.ExecuteAsync();
+
+            Assert.IsNull(cleanup.LastPlan);
+            Assert.AreEqual(0, sqlite.LastIds.Count);
+            Assert.AreEqual(1, scanner.ScanCalls);
+            StringAssert.Contains(dialogs.LastTitle!, "确认清理");
+        });
+    }
+
+    [TestMethod]
+    public async Task CleanupStaleSessions_CursorRunningDoesNotClean()
+    {
+        await RunStaAsync(async () =>
+        {
+            using var temp = new TemporaryDirectory();
+            var rootPath = Path.Combine(temp.Path, "Cursor");
+            Directory.CreateDirectory(rootPath);
+            var oldPath = Path.Combine(rootPath, "old.json");
+            await File.WriteAllTextAsync(oldPath, "session");
+            File.SetLastWriteTimeUtc(oldPath, DateTime.UtcNow.AddDays(-40));
+            var root = new CursorDataRoot(rootPath, RootKind.RoamingData, "test");
+            var oldItem = Item(root, "old.json", DataCategory.ChatSession, DateTime.UtcNow.AddDays(-40));
+            var oldSession = new SessionInfo("old", oldItem.FullPath, "旧会话", "p", DataCategory.ChatSession, 10, DateTime.UtcNow.AddDays(-40));
+            var cleanup = new RecordingCleanupService();
+            var dialogs = new FixedDialogService(true);
+            using var viewModel = CreateViewModel(
+                new FixedScanner(Result(oldItem)),
+                new ScanResultStore(),
+                new FixedWorkspaceAnalyzer([]),
+                new FixedSessionAnalyzer([oldSession]),
+                cleanup: cleanup,
+                dialogs: dialogs,
+                pathService: new FixedPathService(root),
+                process: new FixedProcessService(true));
+
+            await viewModel.ScanForTestingAsync();
+            await viewModel.CleanupStaleSessionsCommand.ExecuteAsync();
+
+            Assert.IsNull(cleanup.LastPlan);
+            Assert.AreEqual("无法清理旧数据", dialogs.LastTitle);
+            StringAssert.Contains(dialogs.LastMessage!, "Cursor 正在运行");
+        });
+    }
+
+    [TestMethod]
+    public async Task DeleteSelectedSessions_SuccessfulSqliteSuggestsOptimizeWithoutAdvancedTools()
+    {
+        await RunStaAsync(async () =>
+        {
+            using var temp = new TemporaryDirectory();
+            var rootPath = Path.Combine(temp.Path, "Cursor");
+            Directory.CreateDirectory(rootPath);
+            var databasePath = Path.Combine(rootPath, "state.vscdb");
+            await File.WriteAllTextAsync(databasePath, "db");
+            var root = new CursorDataRoot(rootPath, RootKind.RoamingData, "test");
+            var database = Item(root, "state.vscdb", DataCategory.SQLite, DateTime.UtcNow);
+            var session = new SessionInfo(
+                "488ef4de-7b32-4b7c-b7be-6b67203f8717",
+                string.Empty,
+                "Greeting conversation",
+                "empty-window",
+                DataCategory.ChatSession,
+                0,
+                DateTime.UtcNow.AddDays(-40),
+                SessionSource.Database,
+                databasePath,
+                ["488ef4de-7b32-4b7c-b7be-6b67203f8717"]);
+            var sqlite = new RecordingSqliteService();
+            var dialogs = new FixedDialogService(true);
+            using var viewModel = CreateViewModel(
+                new RecordingScanner(Result(database), Result(database)),
+                new ScanResultStore(),
+                new FixedWorkspaceAnalyzer([]),
+                new FixedSessionAnalyzer([session]),
+                cleanup: new RecordingCleanupService(),
+                dialogs: dialogs,
+                pathService: new FixedPathService(root),
+                sqlite: sqlite);
+
+            await viewModel.ScanForTestingAsync();
+            Assert.IsFalse(viewModel.AdvancedToolsEnabled);
+            await viewModel.DeleteSelectedSessionsCommand.ExecuteAsync(new ArrayList { session });
+
+            Assert.IsTrue(viewModel.SuggestDatabaseOptimize);
+            Assert.IsTrue(viewModel.OptimizeSuggestedDatabaseCommand.CanExecute(null));
+            StringAssert.Contains(dialogs.LastMessage!, "可选择优化数据库");
+            Assert.IsFalse(viewModel.VacuumCommand.CanExecute(null));
+        });
+    }
+
+    [TestMethod]
     public async Task EmptyPreview_DoesNotEnableCleanup_AndSettingsBecomeDirty()
     {
         await RunStaAsync(async () =>
@@ -266,7 +473,10 @@ public sealed class MainViewModelTests
             Assert.AreEqual(2, scanner.ScanCalls);
             Assert.AreEqual(1, viewModel.SelectedPage);
             StringAssert.Contains(dialogs.LastTitle, "确认删除所选会话");
-            StringAssert.Contains(dialogs.LastMessage!, "没有可匹配的 SQLite ID");
+            StringAssert.Contains(dialogs.LastMessage!, "没有可匹配的会话 ID");
+            StringAssert.Contains(dialogs.LastMessage!, "会话文件：");
+            Assert.IsFalse(dialogs.LastMessage!.Contains("只保留最新一份", StringComparison.Ordinal));
+            Assert.IsFalse(dialogs.LastMessage!.Contains("预计立即释放 0.0 B", StringComparison.Ordinal));
             StringAssert.Contains(viewModel.OperationStatus, "清理已取消");
         });
     }
@@ -315,7 +525,62 @@ public sealed class MainViewModelTests
             CollectionAssert.AreEqual(new[] { "488ef4de-7b32-4b7c-b7be-6b67203f8717" }, sqlite.LastIds.ToArray());
             CollectionAssert.AreEqual(new[] { databasePath }, sqlite.LastDatabasePaths.ToArray());
             StringAssert.Contains(dialogs.LastMessage!, "SQLite");
+            StringAssert.Contains(dialogs.LastMessage!, "只保留最新一份");
+            StringAssert.Contains(dialogs.LastMessage!, "不会立刻变小");
+            StringAssert.Contains(dialogs.LastMessage!, "优化数据库");
+            Assert.IsFalse(dialogs.LastMessage!.Contains("预计立即释放 0.0 B", StringComparison.Ordinal));
+            StringAssert.Contains(viewModel.OperationStatus, "优化数据库");
             Assert.AreEqual(2, scanner.ScanCalls);
+        });
+    }
+
+    [TestMethod]
+    public async Task DeleteSelectedSessions_SqliteFailureDoesNotDeleteFiles()
+    {
+        await RunStaAsync(async () =>
+        {
+            using var temp = new TemporaryDirectory();
+            var rootPath = Path.Combine(temp.Path, "Cursor");
+            Directory.CreateDirectory(rootPath);
+            var sessionPath = Path.Combine(rootPath, "session.json");
+            var databasePath = Path.Combine(rootPath, "state.vscdb");
+            await File.WriteAllTextAsync(sessionPath, "session");
+            await File.WriteAllTextAsync(databasePath, "db");
+            var root = new CursorDataRoot(rootPath, RootKind.RoamingData, "test");
+            var sessionItem = Item(root, "session.json", DataCategory.ChatSession, DateTime.UtcNow);
+            var database = Item(root, "state.vscdb", DataCategory.SQLite, DateTime.UtcNow);
+            var session = new SessionInfo(
+                "488ef4de-7b32-4b7c-b7be-6b67203f8717",
+                sessionItem.FullPath,
+                "Greeting conversation",
+                "empty-window",
+                DataCategory.ChatSession,
+                10,
+                DateTime.UtcNow,
+                SessionSource.Both,
+                databasePath,
+                ["488ef4de-7b32-4b7c-b7be-6b67203f8717"]);
+            var scanner = new RecordingScanner(Result(sessionItem, database), Result(sessionItem, database));
+            var cleanup = new RecordingCleanupService();
+            var sqlite = new FailingSqliteService();
+            var dialogs = new FixedDialogService(true);
+            using var viewModel = CreateViewModel(
+                scanner,
+                new ScanResultStore(),
+                new FixedWorkspaceAnalyzer([]),
+                new FixedSessionAnalyzer([session]),
+                cleanup: cleanup,
+                dialogs: dialogs,
+                pathService: new FixedPathService(root),
+                sqlite: sqlite);
+
+            await viewModel.ScanForTestingAsync();
+            await viewModel.DeleteSelectedSessionsCommand.ExecuteAsync(new ArrayList { session });
+
+            Assert.IsNull(cleanup.LastPlan);
+            StringAssert.Contains(viewModel.OperationStatus, "未删除会话文件");
+            StringAssert.Contains(dialogs.LastTitle!, "SQLite 未完整成功");
+            Assert.IsTrue(File.Exists(sessionPath));
         });
     }
 
@@ -323,12 +588,34 @@ public sealed class MainViewModelTests
     public void DisplayText_ReturnsChineseLabels()
     {
         var utc = new DateTime(2026, 8, 20, 12, 30, 0, DateTimeKind.Utc);
+        var databaseOnly = new SessionInfo(
+            "488ef4de-7b32-4b7c-b7be-6b67203f8717",
+            string.Empty,
+            "db",
+            null,
+            DataCategory.ChatSession,
+            0,
+            utc,
+            SessionSource.Database,
+            "/tmp/state.vscdb");
+        var fileSession = new SessionInfo(
+            "file",
+            "/tmp/a.json",
+            "file",
+            "p",
+            DataCategory.ChatSession,
+            1024,
+            utc,
+            SessionSource.File);
 
         Assert.AreEqual("历史会话", DisplayText.Category(DataCategory.ChatSession));
         Assert.AreEqual("跟随系统", DisplayText.Theme(CleanerTheme.System));
         Assert.AreEqual("可按会话删除", DisplayText.Recommendation(DataCategory.ChatSession));
         Assert.AreEqual("项目路径已不存在，可考虑清理", DisplayText.WorkspaceRecommendation(true));
         Assert.AreEqual(utc.ToLocalTime().ToString("yyyy-MM-dd HH:mm"), DisplayText.LocalTime(utc));
+        Assert.AreEqual("—", DisplayText.FormatSessionSize(databaseOnly));
+        Assert.AreEqual("—", databaseOnly.DisplaySizeText);
+        Assert.AreEqual(ByteSizeFormatter.Format(1024), DisplayText.FormatSessionSize(fileSession));
     }
 
     [TestMethod]
@@ -344,6 +631,134 @@ public sealed class MainViewModelTests
         viewModel.SelectedPage = 4;
         viewModel.AdvancedToolsEnabled = false;
         Assert.AreEqual(5, viewModel.SelectedPage);
+    }
+
+    [TestMethod]
+    public async Task CleanupLegacySqliteBackups_ConfirmsAndLeavesRollingBackup()
+    {
+        await RunStaAsync(async () =>
+        {
+            var backup = new RecordingBackupService(
+                Path.Combine(Path.GetTempPath(), "CursorCleanerBackup"),
+                new SqliteBackupUsage(Path.Combine(Path.GetTempPath(), "CursorCleanerBackup"), 100, 1, 200, 2));
+            var dialogs = new FixedDialogService(true);
+            using var viewModel = CreateViewModel(
+                new FixedScanner(Result()),
+                new ScanResultStore(),
+                new FixedWorkspaceAnalyzer([]),
+                new FixedSessionAnalyzer([]),
+                dialogs: dialogs,
+                backup: backup);
+            viewModel.AdvancedToolsEnabled = true;
+
+            await viewModel.CleanupLegacySqliteBackupsCommand.ExecuteAsync();
+
+            Assert.AreEqual(1, backup.CleanupCalls);
+            StringAssert.Contains(dialogs.LastTitle, "确认删除旧 SQLite 备份");
+            StringAssert.Contains(dialogs.LastMessage!, "不会删除会话文件备份");
+            StringAssert.Contains(viewModel.SqliteBackupCleanupStatus, "已删除");
+        });
+    }
+
+    [TestMethod]
+    public async Task StopCursor_NotRunning_CommandDisabled()
+    {
+        await RunStaAsync(async () =>
+        {
+            using var viewModel = CreateViewModel(
+                new FixedScanner(Result()),
+                new ScanResultStore(),
+                new FixedWorkspaceAnalyzer([]),
+                new FixedSessionAnalyzer([]),
+                process: new FixedProcessService(false));
+            await viewModel.InitializeAsync();
+
+            Assert.IsFalse(viewModel.CanStopCursor);
+            Assert.IsFalse(viewModel.StopCursorCommand.CanExecute(null));
+            Assert.AreEqual("Cursor 未运行", viewModel.CursorStateText);
+        });
+    }
+
+    [TestMethod]
+    public async Task StopCursor_ConfirmCancel_DoesNotStop()
+    {
+        await RunStaAsync(async () =>
+        {
+            var process = new FixedProcessService(true);
+            var dialogs = new FixedDialogService(false);
+            using var viewModel = CreateViewModel(
+                new FixedScanner(Result()),
+                new ScanResultStore(),
+                new FixedWorkspaceAnalyzer([]),
+                new FixedSessionAnalyzer([]),
+                dialogs: dialogs,
+                process: process);
+            await viewModel.InitializeAsync();
+
+            Assert.IsTrue(viewModel.CanStopCursor);
+            await viewModel.StopCursorCommand.ExecuteAsync();
+
+            Assert.AreEqual(0, process.StopCalls);
+            Assert.IsTrue(viewModel.IsCursorRunning);
+            Assert.AreEqual("确认强制停止 Cursor", dialogs.LastTitle);
+        });
+    }
+
+    [TestMethod]
+    public async Task StopCursor_ConfirmSuccess_RefreshesState()
+    {
+        await RunStaAsync(async () =>
+        {
+            var process = new FixedProcessService(true);
+            var dialogs = new FixedDialogService(true);
+            using var viewModel = CreateViewModel(
+                new FixedScanner(Result()),
+                new ScanResultStore(),
+                new FixedWorkspaceAnalyzer([]),
+                new FixedSessionAnalyzer([]),
+                dialogs: dialogs,
+                process: process);
+            await viewModel.InitializeAsync();
+
+            await viewModel.StopCursorCommand.ExecuteAsync();
+
+            Assert.AreEqual(1, process.StopCalls);
+            Assert.IsFalse(viewModel.IsCursorRunning);
+            Assert.IsFalse(viewModel.CanStopCursor);
+            Assert.AreEqual("Cursor 未运行", viewModel.CursorStateText);
+            Assert.AreEqual("Cursor 已停止", viewModel.OperationStatus);
+            Assert.AreEqual(StatusSeverity.Success, viewModel.OperationStatusSeverity);
+        });
+    }
+
+    [TestMethod]
+    public async Task StopCursor_Failure_ShowsErrorAndStaysRunning()
+    {
+        await RunStaAsync(async () =>
+        {
+            var process = new FixedProcessService(true)
+            {
+                StopResult = new StopCursorResult(false, true, 0, "permission denied")
+            };
+            var dialogs = new FixedDialogService(true);
+            using var viewModel = CreateViewModel(
+                new FixedScanner(Result()),
+                new ScanResultStore(),
+                new FixedWorkspaceAnalyzer([]),
+                new FixedSessionAnalyzer([]),
+                dialogs: dialogs,
+                process: process);
+            await viewModel.InitializeAsync();
+
+            await viewModel.StopCursorCommand.ExecuteAsync();
+
+            Assert.AreEqual(1, process.StopCalls);
+            Assert.IsTrue(viewModel.IsCursorRunning);
+            Assert.IsTrue(viewModel.CanStopCursor);
+            StringAssert.Contains(viewModel.OperationStatus, "permission denied");
+            Assert.AreEqual(StatusSeverity.Error, viewModel.OperationStatusSeverity);
+            Assert.AreEqual("无法停止 Cursor", dialogs.LastTitle);
+        });
     }
 
     [TestMethod]
@@ -406,17 +821,20 @@ public sealed class MainViewModelTests
         ICleanupService? cleanup = null,
         ICursorPathService? pathService = null,
         ISessionContentService? sessionContent = null,
-        ISqliteService? sqlite = null)
+        ISqliteService? sqlite = null,
+        IBackupService? backup = null,
+        IProcessService? process = null)
     {
         pathService ??= new FixedPathService();
         return new(
             pathService, scanner, workspaceAnalyzer, sessionAnalyzer, store,
-            new FixedProcessService(), new NullLogService(), settings ?? new MemorySettingsService(),
+            process ?? new FixedProcessService(), new NullLogService(), settings ?? new MemorySettingsService(),
             planner ?? new CleanupPlannerService(new PathGuard(pathService.GetDataRoots().Select(root => root.Path))),
             cleanup ?? new NullCleanupService(), new NullShellService(),
             sqlite ?? new NullSqliteService(), dialogs ?? new NullDialogService(),
             sessionContent ?? new NullSessionContentService(),
-            new NullThemeService());
+            new NullThemeService(),
+            backup ?? new NullBackupService());
     }
 
     private static ScanItem Item(CursorDataRoot root, string relative, DataCategory category, DateTime? time = null) =>
@@ -518,7 +936,34 @@ public sealed class MainViewModelTests
         public Task<IReadOnlyList<SessionInfo>> AnalyzeAsync(ScanResult scanResult, CancellationToken cancellationToken = default) => Task.FromResult(result);
     }
 
-    private sealed class FixedProcessService : IProcessService { public bool IsCursorRunning() => false; }
+    private sealed class FixedProcessService : IProcessService
+    {
+        private bool _running;
+        public int StopCalls { get; private set; }
+        public StopCursorResult StopResult { get; set; } = new(true, false, 0, null);
+
+        public FixedProcessService(bool running = false)
+        {
+            _running = running;
+            if (running)
+            {
+                StopResult = new StopCursorResult(true, true, 1, null);
+            }
+        }
+
+        public bool IsCursorRunning() => _running;
+
+        public Task<StopCursorResult> StopCursorAsync(CancellationToken cancellationToken = default)
+        {
+            StopCalls++;
+            if (StopResult.Succeeded)
+            {
+                _running = false;
+            }
+
+            return Task.FromResult(StopResult);
+        }
+    }
     private sealed class NullLogService : ILogService
     {
         public string LogDirectory => Path.GetTempPath();
@@ -636,5 +1081,68 @@ public sealed class MainViewModelTests
     private sealed class NullThemeService : IThemeService
     {
         public void Apply(CleanerTheme theme) { }
+    }
+
+    private sealed class NullBackupService : IBackupService
+    {
+        public string BackupRootPath => Path.GetTempPath();
+        public Task<BackupOperationResult> BackupAsync(IEnumerable<CleanupPlanItem> items, CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+        public Task<string> CreateSqliteBackupPathAsync(string databasePath, CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+        public Task<string> CommitSqliteBackupAsync(string stagingPath, CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+        public void EnsureVolumeFreeSpace(string pathOnVolume, long requiredBytes, string operationLabel) { }
+        public SqliteBackupUsage GetSqliteBackupUsage() => new(BackupRootPath, 0, 0, 0, 0);
+        public Task<SqliteBackupCleanupResult> CleanupLegacySqliteBackupsAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult(new SqliteBackupCleanupResult(true, 0, 0, null));
+    }
+
+    private sealed class RecordingBackupService : IBackupService
+    {
+        public string BackupRootPath { get; }
+        public SqliteBackupUsage Usage { get; set; }
+        public SqliteBackupCleanupResult CleanupResult { get; set; } = new(true, 1, 10, null);
+        public int CleanupCalls { get; private set; }
+
+        public RecordingBackupService(string backupRootPath, SqliteBackupUsage? usage = null)
+        {
+            BackupRootPath = backupRootPath;
+            Usage = usage ?? new SqliteBackupUsage(backupRootPath, 0, 0, 0, 0);
+        }
+
+        public Task<BackupOperationResult> BackupAsync(IEnumerable<CleanupPlanItem> items, CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+        public Task<string> CreateSqliteBackupPathAsync(string databasePath, CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+        public Task<string> CommitSqliteBackupAsync(string stagingPath, CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+        public void EnsureVolumeFreeSpace(string pathOnVolume, long requiredBytes, string operationLabel) { }
+        public SqliteBackupUsage GetSqliteBackupUsage() => Usage;
+        public Task<SqliteBackupCleanupResult> CleanupLegacySqliteBackupsAsync(CancellationToken cancellationToken = default)
+        {
+            CleanupCalls++;
+            return Task.FromResult(CleanupResult);
+        }
+    }
+
+    private sealed class FailingSqliteService : ISqliteService
+    {
+        public Task<SqliteMaintenanceResult> VacuumAsync(string databasePath, IEnumerable<string> approvedRoots, CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+
+        public Task<SqliteChatCleanupResult> DeleteChatRecordsAsync(
+            IEnumerable<string> conversationIds,
+            IEnumerable<string> databasePaths,
+            IEnumerable<string> approvedRoots,
+            CancellationToken cancellationToken = default)
+        {
+            var paths = databasePaths.ToArray();
+            return Task.FromResult(new SqliteChatCleanupResult(
+                false,
+                false,
+                [new SqliteChatDatabaseResult(paths.FirstOrDefault() ?? string.Empty, false, 0, null, "Injected SQLite failure.")],
+                "Injected SQLite failure."));
+        }
     }
 }

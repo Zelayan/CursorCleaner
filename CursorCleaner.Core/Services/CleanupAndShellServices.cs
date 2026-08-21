@@ -111,7 +111,7 @@ public sealed class CleanupService : ICleanupService
                 backupsByPath[PathSafety.Normalize(backedUpItem.OriginalPath)] = backedUpItem;
             }
 
-            if (!backup.Succeeded && backup.Files.Count == 0)
+            if (!backup.Succeeded)
             {
                 return new CleanupOperationResult(plan.Id, false, true, false, [], backup.Error ?? "Backup failed; no files were deleted.");
             }
