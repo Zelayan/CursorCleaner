@@ -4,6 +4,7 @@ using System.Text.Json;
 using CursorCleaner.Helpers;
 using CursorCleaner.Models;
 using Microsoft.Data.Sqlite;
+using SQLitePCL;
 
 namespace CursorCleaner.Services;
 
@@ -27,6 +28,7 @@ public sealed class SqliteService : ISqliteService
     public async Task<SqliteMaintenanceResult> VacuumAsync(
         string databasePath,
         IEnumerable<string> approvedRoots,
+        IProgress<SqliteProgress>? progress = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(approvedRoots);
@@ -41,7 +43,7 @@ public sealed class SqliteService : ISqliteService
         var gate = await AcquireDatabaseLockAsync(path, cancellationToken).ConfigureAwait(false);
         try
         {
-            return await VacuumCoreAsync(path, roots, cancellationToken).ConfigureAwait(false);
+            return await VacuumCoreAsync(path, roots, progress, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -52,6 +54,7 @@ public sealed class SqliteService : ISqliteService
     private async Task<SqliteMaintenanceResult> VacuumCoreAsync(
         string path,
         IReadOnlyList<string> roots,
+        IProgress<SqliteProgress>? progress,
         CancellationToken cancellationToken)
     {
         if (!_pathGuard.TryGetFileIdentity(path, out var initialIdentity, out var identityError))
@@ -102,10 +105,12 @@ public sealed class SqliteService : ISqliteService
                 return Failure(path, sizeBefore, null, "Cursor started before database maintenance; no backup, checkpoint, or VACUUM was performed.");
             }
 
+            Report(progress, SqliteProgressStage.Checking, path);
             await RunQuickCheckAsync(connection, cancellationToken).ConfigureAwait(false);
 
+            Report(progress, SqliteProgressStage.PreparingBackup, path);
             reservedBackupPath = await _backupService.CreateSqliteBackupPathAsync(path, cancellationToken).ConfigureAwait(false);
-            verifiedBackupPath = await CreateVerifiedBackupAsync(connection, reservedBackupPath, cancellationToken).ConfigureAwait(false);
+            verifiedBackupPath = await CreateVerifiedBackupAsync(connection, reservedBackupPath, progress, path, cancellationToken).ConfigureAwait(false);
 
             cancellationToken.ThrowIfCancellationRequested();
             guard = _pathGuard.ValidateSqliteTarget(path, roots);
@@ -119,6 +124,7 @@ public sealed class SqliteService : ISqliteService
                 return Failure(path, sizeBefore, verifiedBackupPath, "Cursor started before checkpoint; the verified backup was kept and no write was started.");
             }
 
+            Report(progress, SqliteProgressStage.Checkpoint, path);
             await RunCheckpointAsync(connection, cancellationToken).ConfigureAwait(false);
 
             cancellationToken.ThrowIfCancellationRequested();
@@ -133,10 +139,12 @@ public sealed class SqliteService : ISqliteService
                 return Failure(path, sizeBefore, verifiedBackupPath, "Cursor started before VACUUM; the verified backup was kept and VACUUM was not started.");
             }
 
+            Report(progress, SqliteProgressStage.Vacuuming, path);
             await using var vacuum = connection.CreateCommand();
             vacuum.CommandText = "VACUUM;";
             await vacuum.ExecuteNonQueryAsync(CancellationToken.None).ConfigureAwait(false);
 
+            Report(progress, SqliteProgressStage.VerifyingResult, path);
             await RunQuickCheckAsync(connection, CancellationToken.None).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
@@ -179,6 +187,7 @@ public sealed class SqliteService : ISqliteService
         }
 
         await TryLogAsync("info", "sqlite.vacuum", $"Database maintenance completed; size changed from {sizeBefore} to {sizeAfter} bytes.", path, null).ConfigureAwait(false);
+        Report(progress, SqliteProgressStage.Completed, path, percent: 100);
         return new SqliteMaintenanceResult(path, true, sizeBefore, sizeAfter, verifiedBackupPath, null);
     }
 
@@ -186,6 +195,7 @@ public sealed class SqliteService : ISqliteService
         IEnumerable<string> conversationIds,
         IEnumerable<string> databasePaths,
         IEnumerable<string> approvedRoots,
+        IProgress<SqliteProgress>? progress = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(conversationIds);
@@ -236,7 +246,7 @@ public sealed class SqliteService : ISqliteService
 
             try
             {
-                results.Add(await DeleteFromDatabaseAsync(databasePath, ids, roots, cancellationToken).ConfigureAwait(false));
+                results.Add(await DeleteFromDatabaseAsync(databasePath, ids, roots, progress, results.Count + 1, paths.Length, cancellationToken).ConfigureAwait(false));
             }
             catch (OperationCanceledException)
             {
@@ -273,6 +283,9 @@ public sealed class SqliteService : ISqliteService
         string databasePath,
         IReadOnlyList<string> ids,
         IReadOnlyList<string> roots,
+        IProgress<SqliteProgress>? progress,
+        int databaseIndex,
+        int databaseCount,
         CancellationToken cancellationToken)
     {
         var guard = _pathGuard.ValidateSqliteTarget(databasePath, roots);
@@ -285,7 +298,7 @@ public sealed class SqliteService : ISqliteService
         var gate = await AcquireDatabaseLockAsync(path, cancellationToken).ConfigureAwait(false);
         try
         {
-            return await DeleteFromDatabaseCoreAsync(path, ids, roots, cancellationToken).ConfigureAwait(false);
+            return await DeleteFromDatabaseCoreAsync(path, ids, roots, progress, databaseIndex, databaseCount, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -297,6 +310,9 @@ public sealed class SqliteService : ISqliteService
         string path,
         IReadOnlyList<string> ids,
         IReadOnlyList<string> roots,
+        IProgress<SqliteProgress>? progress,
+        int databaseIndex,
+        int databaseCount,
         CancellationToken cancellationToken)
     {
         if (!_pathGuard.TryGetFileIdentity(path, out var initialIdentity, out var identityError))
@@ -328,6 +344,7 @@ public sealed class SqliteService : ISqliteService
                 return new SqliteChatDatabaseResult(path, false, 0, null, "Cursor started before chat deletion; no backup or write was performed.");
             }
 
+            Report(progress, SqliteProgressStage.Checking, path, databaseIndex, databaseCount);
             await RunQuickCheckAsync(connection, cancellationToken).ConfigureAwait(false);
 
             var shape = await CursorChatSchema.DiscoverAsync(connection, cancellationToken).ConfigureAwait(false);
@@ -338,16 +355,19 @@ public sealed class SqliteService : ISqliteService
 
             if (!await CursorChatSchema.HasChatDataAsync(connection, shape, cancellationToken).ConfigureAwait(false))
             {
+                Report(progress, SqliteProgressStage.Completed, path, databaseIndex, databaseCount, 100);
                 return new SqliteChatDatabaseResult(path, true, 0, null, "Skipped: no Cursor chat records were found.");
             }
 
             if (!await CursorChatSchema.HasMatchingConversationAsync(connection, shape, ids, cancellationToken).ConfigureAwait(false))
             {
+                Report(progress, SqliteProgressStage.Completed, path, databaseIndex, databaseCount, 100);
                 return new SqliteChatDatabaseResult(path, true, 0, null, "No matching chat rows were found.");
             }
 
+            Report(progress, SqliteProgressStage.PreparingBackup, path, databaseIndex, databaseCount);
             reservedBackupPath = await _backupService.CreateSqliteBackupPathAsync(path, cancellationToken).ConfigureAwait(false);
-            verifiedBackupPath = await CreateVerifiedBackupAsync(connection, reservedBackupPath, cancellationToken).ConfigureAwait(false);
+            verifiedBackupPath = await CreateVerifiedBackupAsync(connection, reservedBackupPath, progress, path, cancellationToken, databaseIndex, databaseCount).ConfigureAwait(false);
 
             cancellationToken.ThrowIfCancellationRequested();
             guard = _pathGuard.ValidateSqliteTarget(path, roots);
@@ -361,8 +381,10 @@ public sealed class SqliteService : ISqliteService
                 return new SqliteChatDatabaseResult(path, false, 0, verifiedBackupPath, "Cursor started before chat deletion; the verified backup was kept and no write was started.");
             }
 
+            Report(progress, SqliteProgressStage.DeletingRows, path, databaseIndex, databaseCount);
             var deleted = await CursorChatSchema.DeleteAsync(connection, shape, ids, cancellationToken).ConfigureAwait(false);
             await TryLogAsync("info", "sqlite.chat.delete", $"Deleted {deleted} chat rows for {ids.Count} conversation IDs.", path, null).ConfigureAwait(false);
+            Report(progress, SqliteProgressStage.Completed, path, databaseIndex, databaseCount, 100);
             return new SqliteChatDatabaseResult(path, true, deleted, verifiedBackupPath, deleted == 0 ? "No matching chat rows were found." : null);
         }
         catch (OperationCanceledException)
@@ -416,17 +438,103 @@ public sealed class SqliteService : ISqliteService
         return true;
     }
 
-    private async Task<string> CreateVerifiedBackupAsync(SqliteConnection connection, string stagingPath, CancellationToken cancellationToken)
+    private async Task<string> CreateVerifiedBackupAsync(
+        SqliteConnection connection,
+        string stagingPath,
+        IProgress<SqliteProgress>? progress,
+        string sourcePath,
+        CancellationToken cancellationToken,
+        int databaseIndex = 1,
+        int databaseCount = 1)
     {
         await using (var backupConnection = new SqliteConnection(BuildConnectionString(stagingPath, SqliteOpenMode.ReadWriteCreate)))
         {
             await backupConnection.OpenAsync(cancellationToken).ConfigureAwait(false);
-            connection.BackupDatabase(backupConnection);
+            await BackupDatabaseWithProgressAsync(connection, backupConnection, progress, sourcePath, databaseIndex, databaseCount, cancellationToken).ConfigureAwait(false);
+            Report(progress, SqliteProgressStage.VerifyingBackup, sourcePath, databaseIndex, databaseCount);
             await RunQuickCheckAsync(backupConnection, cancellationToken).ConfigureAwait(false);
             await RunCheckpointAsync(backupConnection, cancellationToken).ConfigureAwait(false);
         }
 
         return await _backupService.CommitSqliteBackupAsync(stagingPath, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task BackupDatabaseWithProgressAsync(
+        SqliteConnection source,
+        SqliteConnection destination,
+        IProgress<SqliteProgress>? progress,
+        string sourcePath,
+        int databaseIndex,
+        int databaseCount,
+        CancellationToken cancellationToken)
+    {
+        var sourceHandle = source.Handle;
+        var destinationHandle = destination.Handle;
+        if (sourceHandle is null || destinationHandle is null || sourceHandle.IsInvalid || destinationHandle.IsInvalid)
+        {
+            throw new IOException("SQLite connection handle is unavailable for online backup.");
+        }
+
+        using var backup = raw.sqlite3_backup_init(destinationHandle, "main", sourceHandle, "main");
+        if (backup is null || backup.IsInvalid)
+        {
+            throw new IOException("SQLite online backup could not be started.");
+        }
+
+        Report(progress, SqliteProgressStage.BackingUp, sourcePath, databaseIndex, databaseCount, 0);
+        var lastReported = -1;
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var rc = raw.sqlite3_backup_step(backup, 64);
+            if (rc is not raw.SQLITE_OK and not raw.SQLITE_DONE and not raw.SQLITE_BUSY and not raw.SQLITE_LOCKED)
+            {
+                throw new IOException($"SQLite online backup failed with code {rc}.");
+            }
+
+            var remaining = raw.sqlite3_backup_remaining(backup);
+            var pageCount = raw.sqlite3_backup_pagecount(backup);
+            var percent = pageCount <= 0
+                ? 0
+                : Math.Clamp((int)Math.Round((pageCount - remaining) * 100d / pageCount), 0, 100);
+            if (percent != lastReported)
+            {
+                lastReported = percent;
+                Report(progress, SqliteProgressStage.BackingUp, sourcePath, databaseIndex, databaseCount, percent);
+            }
+
+            if (rc == raw.SQLITE_DONE)
+            {
+                break;
+            }
+
+            if (rc is raw.SQLITE_BUSY or raw.SQLITE_LOCKED)
+            {
+                await Task.Delay(15, cancellationToken).ConfigureAwait(false);
+                continue;
+            }
+
+            await Task.Yield();
+        }
+
+        Report(progress, SqliteProgressStage.BackingUp, sourcePath, databaseIndex, databaseCount, 100);
+    }
+
+    private static void Report(
+        IProgress<SqliteProgress>? progress,
+        SqliteProgressStage stage,
+        string databasePath,
+        int databaseIndex = 1,
+        int databaseCount = 1,
+        int? percent = null)
+    {
+        progress?.Report(new SqliteProgress(
+            stage,
+            databasePath,
+            databaseIndex,
+            databaseCount,
+            percent,
+            DisplayText.SqliteProgressMessage(stage, databasePath, databaseIndex, databaseCount, percent)));
     }
 
     private static async Task<SemaphoreSlim> AcquireDatabaseLockAsync(string path, CancellationToken cancellationToken)

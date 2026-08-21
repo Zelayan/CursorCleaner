@@ -675,6 +675,9 @@ public sealed class MainViewModelTests
         Assert.AreEqual("—", DisplayText.FormatSessionSize(databaseOnly));
         Assert.AreEqual("—", databaseOnly.DisplaySizeText);
         Assert.AreEqual(ByteSizeFormatter.Format(1024), DisplayText.FormatSessionSize(fileSession));
+        Assert.AreEqual("state.vscdb：正在完整性检查（大库可能需数分钟）", DisplayText.SqliteProgressMessage(SqliteProgressStage.Checking, "/tmp/state.vscdb", 1, 1, null));
+        Assert.AreEqual("库 2/9 conversation-search.db：正在在线备份 41%", DisplayText.SqliteProgressMessage(SqliteProgressStage.BackingUp, "/tmp/conversation-search.db", 2, 9, 41));
+        Assert.AreEqual("state.vscdb：正在 VACUUM，开始后不可取消", DisplayText.SqliteProgressMessage(SqliteProgressStage.Vacuuming, "/tmp/state.vscdb", 1, 1, null));
     }
 
     [TestMethod]
@@ -1084,8 +1087,8 @@ public sealed class MainViewModelTests
     }
     private sealed class NullSqliteService : ISqliteService
     {
-        public Task<SqliteMaintenanceResult> VacuumAsync(string databasePath, IEnumerable<string> approvedRoots, CancellationToken cancellationToken = default) => throw new NotSupportedException();
-        public Task<SqliteChatCleanupResult> DeleteChatRecordsAsync(IEnumerable<string> conversationIds, IEnumerable<string> databasePaths, IEnumerable<string> approvedRoots, CancellationToken cancellationToken = default) =>
+        public Task<SqliteMaintenanceResult> VacuumAsync(string databasePath, IEnumerable<string> approvedRoots, IProgress<SqliteProgress>? progress = null, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<SqliteChatCleanupResult> DeleteChatRecordsAsync(IEnumerable<string> conversationIds, IEnumerable<string> databasePaths, IEnumerable<string> approvedRoots, IProgress<SqliteProgress>? progress = null, CancellationToken cancellationToken = default) =>
             Task.FromResult(new SqliteChatCleanupResult(true, false, [], null));
     }
 
@@ -1093,12 +1096,16 @@ public sealed class MainViewModelTests
     {
         public IReadOnlyList<string> LastIds { get; private set; } = [];
         public IReadOnlyList<string> LastDatabasePaths { get; private set; } = [];
-        public Task<SqliteMaintenanceResult> VacuumAsync(string databasePath, IEnumerable<string> approvedRoots, CancellationToken cancellationToken = default) => throw new NotSupportedException();
-        public Task<SqliteChatCleanupResult> DeleteChatRecordsAsync(IEnumerable<string> conversationIds, IEnumerable<string> databasePaths, IEnumerable<string> approvedRoots, CancellationToken cancellationToken = default)
+        public Task<SqliteMaintenanceResult> VacuumAsync(string databasePath, IEnumerable<string> approvedRoots, IProgress<SqliteProgress>? progress = null, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<SqliteChatCleanupResult> DeleteChatRecordsAsync(IEnumerable<string> conversationIds, IEnumerable<string> databasePaths, IEnumerable<string> approvedRoots, IProgress<SqliteProgress>? progress = null, CancellationToken cancellationToken = default)
         {
             LastIds = conversationIds.ToArray();
             LastDatabasePaths = databasePaths.ToArray();
-            return Task.FromResult(new SqliteChatCleanupResult(true, false, [new SqliteChatDatabaseResult(LastDatabasePaths.FirstOrDefault() ?? string.Empty, true, 3, null, null)], null));
+            var path = LastDatabasePaths.FirstOrDefault() ?? string.Empty;
+            progress?.Report(new SqliteProgress(SqliteProgressStage.Checking, path, 1, 1, null, DisplayText.SqliteProgressMessage(SqliteProgressStage.Checking, path, 1, 1, null)));
+            progress?.Report(new SqliteProgress(SqliteProgressStage.BackingUp, path, 1, 1, 40, DisplayText.SqliteProgressMessage(SqliteProgressStage.BackingUp, path, 1, 1, 40)));
+            progress?.Report(new SqliteProgress(SqliteProgressStage.DeletingRows, path, 1, 1, null, DisplayText.SqliteProgressMessage(SqliteProgressStage.DeletingRows, path, 1, 1, null)));
+            return Task.FromResult(new SqliteChatCleanupResult(true, false, [new SqliteChatDatabaseResult(path, true, 3, null, null)], null));
         }
     }
     private sealed class NullSessionContentService : ISessionContentService
@@ -1171,13 +1178,14 @@ public sealed class MainViewModelTests
 
     private sealed class FailingSqliteService : ISqliteService
     {
-        public Task<SqliteMaintenanceResult> VacuumAsync(string databasePath, IEnumerable<string> approvedRoots, CancellationToken cancellationToken = default) =>
+        public Task<SqliteMaintenanceResult> VacuumAsync(string databasePath, IEnumerable<string> approvedRoots, IProgress<SqliteProgress>? progress = null, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
 
         public Task<SqliteChatCleanupResult> DeleteChatRecordsAsync(
             IEnumerable<string> conversationIds,
             IEnumerable<string> databasePaths,
             IEnumerable<string> approvedRoots,
+            IProgress<SqliteProgress>? progress = null,
             CancellationToken cancellationToken = default)
         {
             var paths = databasePaths.ToArray();

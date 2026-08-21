@@ -8,7 +8,7 @@
         WindowStartupLocation="CenterScreen">
   <Grid Background="{DynamicResource WindowBrush}">
     <Grid.RowDefinitions>
-      <RowDefinition Height="66"/>
+      <RowDefinition Height="Auto"/>
       <RowDefinition Height="*"/>
       <RowDefinition Height="32"/>
     </Grid.RowDefinitions>
@@ -25,6 +25,9 @@
         </StackPanel>
         <StackPanel Grid.Column="1" VerticalAlignment="Center" HorizontalAlignment="Right" Spacing="4">
           <TextBlock Text="{Binding BusyText}" FontWeight="SemiBold" HorizontalAlignment="Right"/>
+          <ProgressBar Width="280" Height="6" Minimum="0" Maximum="100" Value="{Binding ProgressPercent}"
+                       IsIndeterminate="{Binding IsProgressIndeterminate}"
+                       IsVisible="{Binding IsProgressVisible}" HorizontalAlignment="Right"/>
           <TextBlock Text="{Binding ScanStatus}" Foreground="{Binding ScanStatusSeverity, Converter={StaticResource StatusBrushConverter}}" HorizontalAlignment="Right"/>
           <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8">
             <TextBlock Text="{Binding CursorStateText}" Foreground="{Binding CursorStatusSeverity, Converter={StaticResource StatusBrushConverter}}" VerticalAlignment="Center"/>
@@ -155,7 +158,7 @@
               </StackPanel>
             </Border>
           </Grid>
-          <Border Grid.Row="3" Classes="card" Padding="10" Margin="0,0,0,12" IsVisible="{Binding IsProgressVisible}">
+          <Border Grid.Row="3" Classes="card" Padding="10" Margin="0,0,0,12" IsVisible="{Binding IsScanProgressVisible}">
             <StackPanel>
               <ProgressBar IsIndeterminate="True"/>
               <Grid Margin="0,7,0,0">
@@ -537,7 +540,8 @@
     <Border Grid.RowSpan="3" ZIndex="100" Background="#90000000" IsVisible="{Binding IsClosing}">
       <Border Background="{DynamicResource SurfaceBrush}" BorderBrush="{DynamicResource StrongBorderBrush}" BorderThickness="1" CornerRadius="6" Padding="24" HorizontalAlignment="Center" VerticalAlignment="Center" MaxWidth="480">
         <StackPanel>
-          <ProgressBar IsIndeterminate="True" Width="340"/>
+          <ProgressBar Width="340" Height="6" Minimum="0" Maximum="100" Value="{Binding ProgressPercent}"
+                       IsIndeterminate="{Binding IsProgressIndeterminate}"/>
           <TextBlock Text="{Binding ClosingStatus}" Margin="0,12,0,0" TextWrapping="Wrap" TextAlignment="Center"/>
         </StackPanel>
       </Border>

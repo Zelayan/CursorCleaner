@@ -124,6 +124,27 @@ public sealed record SqliteChatCleanupResult(
     public int FailedDatabases => Databases.Count(item => !item.Succeeded);
 }
 
+public enum SqliteProgressStage
+{
+    Checking,
+    PreparingBackup,
+    BackingUp,
+    VerifyingBackup,
+    DeletingRows,
+    Checkpoint,
+    Vacuuming,
+    VerifyingResult,
+    Completed
+}
+
+public sealed record SqliteProgress(
+    SqliteProgressStage Stage,
+    string DatabasePath,
+    int DatabaseIndex,
+    int DatabaseCount,
+    int? Percent,
+    string Message);
+
 public sealed record SqliteBackupUsage(
     string BackupRootPath,
     long RollingBytes,
@@ -225,12 +246,17 @@ public interface IDialogService
 
 public interface ISqliteService
 {
-    Task<SqliteMaintenanceResult> VacuumAsync(string databasePath, IEnumerable<string> approvedRoots, CancellationToken cancellationToken = default);
+    Task<SqliteMaintenanceResult> VacuumAsync(
+        string databasePath,
+        IEnumerable<string> approvedRoots,
+        IProgress<SqliteProgress>? progress = null,
+        CancellationToken cancellationToken = default);
 
     Task<SqliteChatCleanupResult> DeleteChatRecordsAsync(
         IEnumerable<string> conversationIds,
         IEnumerable<string> databasePaths,
         IEnumerable<string> approvedRoots,
+        IProgress<SqliteProgress>? progress = null,
         CancellationToken cancellationToken = default);
 }
 

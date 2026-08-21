@@ -217,8 +217,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public AsyncRelayCommand SaveSettingsCommand { get; }
 
     public int SelectedPage { get => _selectedPage; set => SetProperty(ref _selectedPage, value); }
-    public bool IsScanning { get => _isScanning; private set { if (SetProperty(ref _isScanning, value)) { OnPropertyChanged(nameof(IsProgressVisible)); OnPropertyChanged(nameof(ShowScanEmptyState)); OnPropertyChanged(nameof(CanStopCursor)); RaiseCommands(); } } }
-    public bool IsBusy { get => _isBusy; private set { if (SetProperty(ref _isBusy, value)) { OnPropertyChanged(nameof(CanEditTargets)); OnPropertyChanged(nameof(CanStopCursor)); RaiseCommands(); } } }
+    public bool IsScanning { get => _isScanning; private set { if (SetProperty(ref _isScanning, value)) { OnPropertyChanged(nameof(IsProgressVisible)); OnPropertyChanged(nameof(IsScanProgressVisible)); OnPropertyChanged(nameof(IsProgressIndeterminate)); OnPropertyChanged(nameof(ShowScanEmptyState)); OnPropertyChanged(nameof(CanStopCursor)); RaiseCommands(); } } }
+    public bool IsBusy { get => _isBusy; private set { if (SetProperty(ref _isBusy, value)) { OnPropertyChanged(nameof(CanEditTargets)); OnPropertyChanged(nameof(CanStopCursor)); OnPropertyChanged(nameof(IsProgressVisible)); OnPropertyChanged(nameof(IsProgressIndeterminate)); RaiseCommands(); } } }
     public bool IsCleaning
     {
         get => _isCleaning;
@@ -247,13 +247,25 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public bool IsScopeRefreshing { get => _isScopeRefreshing; private set => SetProperty(ref _isScopeRefreshing, value); }
     public string BusyText { get => _busyText; private set => SetProperty(ref _busyText, value); }
     public bool CanEditTargets => !IsBusy;
-    public bool IsProgressVisible => IsScanning;
+    public bool IsProgressVisible => IsScanning || IsBusy;
+    public bool IsScanProgressVisible => IsScanning;
+    public bool IsProgressIndeterminate => !IsScanning && ProgressPercent <= 0;
     public string ScanStatus { get => _scanStatus; private set => SetProperty(ref _scanStatus, value); }
     public StatusSeverity ScanStatusSeverity { get => _scanStatusSeverity; private set => SetProperty(ref _scanStatusSeverity, value); }
     public string CurrentScanPath { get => _currentScanPath; private set => SetProperty(ref _currentScanPath, value); }
     public long ProgressFiles { get => _progressFiles; private set => SetProperty(ref _progressFiles, value); }
     public long ProgressBytes { get => _progressBytes; private set => SetProperty(ref _progressBytes, value); }
-    public double ProgressPercent { get => _progressPercent; private set => SetProperty(ref _progressPercent, value); }
+    public double ProgressPercent
+    {
+        get => _progressPercent;
+        private set
+        {
+            if (SetProperty(ref _progressPercent, value))
+            {
+                OnPropertyChanged(nameof(IsProgressIndeterminate));
+            }
+        }
+    }
     public string LastScanText { get => _lastScanText; private set => SetProperty(ref _lastScanText, value); }
     public string DataDirectory => string.Join("  |  ", _pathService.GetDataRoots().Select(r => r.Path));
     public string ScopeNotice => "扫描器会读取全部 Cursor 数据根；以下范围仅筛选显示内容和清理计划。";
@@ -722,7 +734,14 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             if (conversationIds.Length > 0)
             {
                 BusyText = "正在逐个处理聊天数据库；取消后将保留已完成库的结果";
-                sqliteResult = await _sqlite.DeleteChatRecordsAsync(conversationIds, databasePaths, GetApprovedRoots(), token);
+                ProgressPercent = 0;
+                OnPropertyChanged(nameof(IsProgressIndeterminate));
+                sqliteResult = await _sqlite.DeleteChatRecordsAsync(
+                    conversationIds,
+                    databasePaths,
+                    GetApprovedRoots(),
+                    CreateSqliteProgress(),
+                    token);
                 RefreshSqliteBackupUsage();
                 if (sqliteResult.Blocked)
                 {
@@ -809,6 +828,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             IsCleaning = false;
             IsBusy = false;
             BusyText = string.Empty;
+            ProgressPercent = 0;
             RaiseCommands();
         }
     }
@@ -973,17 +993,19 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         if (_process.IsCursorRunning()) { await _dialogs.ShowErrorAsync("无法维护数据库", "Cursor 正在运行，SQLite 维护被阻止。", token); return; }
         var confirmed = await _dialogs.ConfirmAsync(
             "确认 SQLite 维护",
-            $"将对以下数据库执行完整性检查、强制备份和 VACUUM：\n{database.FullPath}\n{FormatSqliteBackupNotice([database.FullPath], includeSourceVacuumSpace: true)}\nVACUUM 开始后不可取消。操作期间请保持 Cursor 关闭。",
+            $"将对以下数据库执行完整性检查、强制备份和 VACUUM：\n{database.FullPath}\n{FormatSqliteBackupNotice([database.FullPath], includeSourceVacuumSpace: true)}\n大数据库的检查和备份可能需要很长时间，界面会显示当前阶段和备份百分比。VACUUM 开始后不可取消。操作期间请保持 Cursor 关闭。",
             token);
         if (!confirmed) return;
         IsBusy = true;
         BusyText = "正在检查、备份并维护数据库；VACUUM 开始后不可取消";
+        ProgressPercent = 0;
+        OnPropertyChanged(nameof(IsProgressIndeterminate));
         _isVacuuming = true;
         SqliteStatus = "正在检查、备份并维护数据库";
         SqliteStatusSeverity = StatusSeverity.Normal;
         try
         {
-            var result = await _sqlite.VacuumAsync(database.FullPath, GetApprovedRoots(), token);
+            var result = await _sqlite.VacuumAsync(database.FullPath, GetApprovedRoots(), CreateSqliteProgress(), token);
             SqliteBefore = result.SizeBefore;
             SqliteAfter = result.SizeAfter;
             OnPropertyChanged(nameof(SqliteReclaimed));
@@ -1020,6 +1042,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             _isVacuuming = false;
             IsBusy = false;
             BusyText = string.Empty;
+            ProgressPercent = 0;
             RaiseCommands();
         }
     }
@@ -1244,7 +1267,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
 
         _closeRequested = true;
-        ClosingStatus = _isVacuuming ? "正在完成数据库维护，完成后将关闭" : "正在取消活动操作并等待关闭";
+        ClosingStatus = _isVacuuming
+            ? (string.IsNullOrWhiteSpace(BusyText) ? "正在完成数据库维护，完成后将关闭" : $"{BusyText}。完成后将关闭")
+            : "正在取消活动操作并等待关闭";
         RaiseCommands();
         _lifetimeCancellation.Cancel();
         _scanCancellation?.Cancel();
@@ -1262,7 +1287,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             Task[] pending;
             lock (_activityGate) pending = _activities.Where(task => !task.IsCompleted).ToArray();
             if (pending.Length == 0) break;
-            if (_isVacuuming) ClosingStatus = "正在完成数据库维护，完成后将关闭";
+            if (_isVacuuming)
+            {
+                ClosingStatus = string.IsNullOrWhiteSpace(BusyText)
+                    ? "正在完成数据库维护，完成后将关闭"
+                    : $"{BusyText}。完成后将关闭";
+            }
             try { await Task.WhenAll(pending); } catch { }
         }
         Dispose();
@@ -1622,6 +1652,44 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             RaiseCommands();
         }
     }
+
+    private IProgress<SqliteProgress> CreateSqliteProgress() =>
+        new Progress<SqliteProgress>(update =>
+        {
+            BusyText = update.Message;
+            if (update.Stage == SqliteProgressStage.BackingUp && update.Percent is int percent)
+            {
+                ProgressPercent = percent;
+            }
+            else if (update.Stage is SqliteProgressStage.Checking or SqliteProgressStage.PreparingBackup
+                or SqliteProgressStage.VerifyingBackup or SqliteProgressStage.DeletingRows
+                or SqliteProgressStage.Checkpoint or SqliteProgressStage.Vacuuming
+                or SqliteProgressStage.VerifyingResult)
+            {
+                ProgressPercent = 0;
+            }
+            else if (update.Stage == SqliteProgressStage.Completed)
+            {
+                ProgressPercent = 100;
+            }
+
+            if (_isVacuuming)
+            {
+                SqliteStatus = update.Message;
+                if (_closeRequested)
+                {
+                    ClosingStatus = $"{update.Message}。完成后将关闭";
+                }
+            }
+            else if (IsCleaning)
+            {
+                OperationStatus = update.Message;
+                if (_closeRequested)
+                {
+                    ClosingStatus = $"{update.Message}。完成后将关闭";
+                }
+            }
+        });
 
     private void RaiseCommands()
     {

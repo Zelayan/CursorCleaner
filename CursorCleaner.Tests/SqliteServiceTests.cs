@@ -28,6 +28,28 @@ public sealed class SqliteServiceTests
     }
 
     [TestMethod]
+    public async Task Vacuum_ReportsCheckBackupAndVacuumProgress()
+    {
+        using var temp = new TemporaryDirectory();
+        var root = Path.Combine(temp.Path, "approved");
+        Directory.CreateDirectory(root);
+        var database = Path.Combine(root, "test.db");
+        await CreateDatabaseAsync(database);
+        var service = CreateService(temp.Path);
+        var reports = new List<SqliteProgress>();
+
+        var result = await service.VacuumAsync(database, [root], new Progress<SqliteProgress>(reports.Add));
+
+        Assert.IsTrue(result.Succeeded, result.Error);
+        CollectionAssert.Contains(reports.Select(item => item.Stage).ToArray(), SqliteProgressStage.Checking);
+        CollectionAssert.Contains(reports.Select(item => item.Stage).ToArray(), SqliteProgressStage.BackingUp);
+        CollectionAssert.Contains(reports.Select(item => item.Stage).ToArray(), SqliteProgressStage.Vacuuming);
+        CollectionAssert.Contains(reports.Select(item => item.Stage).ToArray(), SqliteProgressStage.Completed);
+        Assert.IsTrue(reports.Any(item => item.Stage == SqliteProgressStage.BackingUp && item.Percent == 100));
+        StringAssert.Contains(reports.First(item => item.Stage == SqliteProgressStage.BackingUp && item.Percent == 100).Message, "正在在线备份 100%");
+    }
+
+    [TestMethod]
     public async Task Vacuum_CorruptDatabaseFailsWithoutMaintenance()
     {
         using var temp = new TemporaryDirectory();
@@ -92,13 +114,19 @@ public sealed class SqliteServiceTests
         await SqliteChatFixtures.CreateStateDatabaseAsync(database);
         var service = CreateService(temp.Path);
 
+        var reports = new List<SqliteProgress>();
         var result = await service.DeleteChatRecordsAsync(
             [SqliteChatFixtures.KeepId],
             [database],
-            [root]);
+            [root],
+            new Progress<SqliteProgress>(reports.Add));
 
         Assert.IsTrue(result.Succeeded, result.Error);
         Assert.IsFalse(result.Blocked);
+        CollectionAssert.Contains(reports.Select(item => item.Stage).ToArray(), SqliteProgressStage.Checking);
+        CollectionAssert.Contains(reports.Select(item => item.Stage).ToArray(), SqliteProgressStage.BackingUp);
+        CollectionAssert.Contains(reports.Select(item => item.Stage).ToArray(), SqliteProgressStage.DeletingRows);
+        CollectionAssert.Contains(reports.Select(item => item.Stage).ToArray(), SqliteProgressStage.Completed);
         Assert.IsTrue(result.DeletedRows > 0);
         Assert.IsNotNull(result.Databases[0].BackupPath);
         Assert.IsTrue(File.Exists(result.Databases[0].BackupPath));
@@ -218,7 +246,8 @@ public sealed class SqliteServiceTests
             [SqliteChatFixtures.KeepId],
             [firstDatabase, secondDatabase],
             [firstRoot, secondRoot],
-            cts.Token);
+            progress: null,
+            cancellationToken: cts.Token);
 
         Assert.IsTrue(result.Cancelled);
         Assert.IsFalse(result.Succeeded);
