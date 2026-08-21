@@ -18,8 +18,6 @@ public sealed class OperationSettings
     public bool ScanRoamingData { get; set; } = true;
     public bool ScanLocalData { get; set; } = true;
     public bool ScanUserProfile { get; set; } = true;
-    public bool AdvancedToolsEnabled { get; set; }
-    public bool AdvancedFeaturesEnabled { get; set; }
     public CleanerTheme Theme { get; set; } = CleanerTheme.System;
 }
 

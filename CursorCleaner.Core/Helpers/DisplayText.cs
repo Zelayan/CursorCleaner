@@ -59,7 +59,7 @@ public static class DisplayText
     {
         DataCategory.ChatSession or DataCategory.AgentTranscript => "可按会话删除",
         DataCategory.Workspace => "可按工作区或保留期清理",
-        DataCategory.SQLite => "仅高级工具可维护，不作为普通文件删除",
+        DataCategory.SQLite => "可在数据库页维护，不作为普通文件删除",
         DataCategory.Other => "不纳入普通清理",
         _ => string.Empty
     };

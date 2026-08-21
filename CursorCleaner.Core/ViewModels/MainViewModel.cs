@@ -165,15 +165,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             DeleteSelectedSessionsCommand.Cancel();
             CleanupStaleSessionsCommand.Cancel();
         }, () => IsCleaning);
-        VacuumCommand = new AsyncRelayCommand(token => TrackActivityAsync(() => VacuumAsync(token)), () => SelectedDatabase is not null && AdvancedToolsEnabled && !IsBusy && !IsScanning && !_closeRequested);
+        VacuumCommand = new AsyncRelayCommand(token => TrackActivityAsync(() => VacuumAsync(token)), () => SelectedDatabase is not null && !IsBusy && !IsScanning && !_closeRequested);
         OptimizeSuggestedDatabaseCommand = new AsyncRelayCommand(
             token => TrackActivityAsync(() => VacuumAsync(token)),
             () => SuggestDatabaseOptimize && SelectedDatabase is not null && !IsBusy && !IsScanning && !_closeRequested);
         OpenDirectoryCommand = new RelayCommand(OpenDirectory);
         OpenLogsCommand = new RelayCommand(() => TryShell(_shell.OpenLogs));
         OpenDataDirectoryCommand = new RelayCommand(() => TryShell(() => _shell.OpenDirectory(Path.GetDirectoryName(_settingsService.SettingsPath)!)));
-        OpenSqliteBackupDirectoryCommand = new RelayCommand(() => TryShell(() => _shell.OpenDirectory(_backup.BackupRootPath)), () => AdvancedToolsEnabled && !_closeRequested);
-        CleanupLegacySqliteBackupsCommand = new AsyncRelayCommand(token => TrackActivityAsync(() => CleanupLegacySqliteBackupsAsync(token)), () => AdvancedToolsEnabled && !IsBusy && !IsScanning && !_closeRequested);
+        OpenSqliteBackupDirectoryCommand = new RelayCommand(() => TryShell(() => _shell.OpenDirectory(_backup.BackupRootPath)), () => !_closeRequested);
+        CleanupLegacySqliteBackupsCommand = new AsyncRelayCommand(token => TrackActivityAsync(() => CleanupLegacySqliteBackupsAsync(token)), () => !IsBusy && !IsScanning && !_closeRequested);
         StopCursorCommand = new AsyncRelayCommand(token => TrackActivityAsync(() => StopCursorAsync(token)), () => CanStopCursor);
         SaveSettingsCommand = new AsyncRelayCommand(token => TrackActivityAsync(() => SaveSettingsAsync(token)), () => IsSettingsDirty && !IsBusy && !IsScanning && !_closeRequested);
     }
@@ -424,33 +424,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public bool ScanRoamingData { get => _settings.ScanRoamingData; set { if (_settings.ScanRoamingData != value) { _settings.ScanRoamingData = value; SettingsChanged(nameof(ScanRoamingData), true); } } }
     public bool ScanLocalData { get => _settings.ScanLocalData; set { if (_settings.ScanLocalData != value) { _settings.ScanLocalData = value; SettingsChanged(nameof(ScanLocalData), true); } } }
     public bool ScanUserProfile { get => _settings.ScanUserProfile; set { if (_settings.ScanUserProfile != value) { _settings.ScanUserProfile = value; SettingsChanged(nameof(ScanUserProfile), true); } } }
-    public bool AdvancedFeaturesEnabled
-    {
-        get => _settings.AdvancedFeaturesEnabled;
-        set
-        {
-            if (_settings.AdvancedFeaturesEnabled == value) return;
-            _settings.AdvancedFeaturesEnabled = value;
-            SettingsChanged(nameof(AdvancedFeaturesEnabled));
-            if (!value && SelectedPage is 2 or 3) SelectedPage = 5;
-        }
-    }
-    public bool AdvancedToolsEnabled
-    {
-        get => _settings.AdvancedToolsEnabled;
-        set
-        {
-            if (_settings.AdvancedToolsEnabled == value) return;
-            _settings.AdvancedToolsEnabled = value;
-            SettingsChanged(nameof(AdvancedToolsEnabled));
-            OnPropertyChanged(nameof(AdvancedToolsDisabled));
-            if (!value && SelectedPage == 4) SelectedPage = 5;
-            VacuumCommand.NotifyCanExecuteChanged();
-            OpenSqliteBackupDirectoryCommand.NotifyCanExecuteChanged();
-            CleanupLegacySqliteBackupsCommand.NotifyCanExecuteChanged();
-        }
-    }
-    public bool AdvancedToolsDisabled => !AdvancedToolsEnabled;
     public CleanerTheme Theme { get => _settings.Theme; set { if (_settings.Theme != value) { _settings.Theme = value; SettingsChanged(nameof(Theme)); _theme.Apply(value); } } }
     public string SettingsStatus { get; private set; } = "设置尚未保存";
     public StatusSeverity SettingsStatusSeverity { get => _settingsStatusSeverity; private set => SetProperty(ref _settingsStatusSeverity, value); }
@@ -1222,8 +1195,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             ScanRoamingData = ScanRoamingData,
             ScanLocalData = ScanLocalData,
             ScanUserProfile = ScanUserProfile,
-            AdvancedFeaturesEnabled = AdvancedFeaturesEnabled,
-            AdvancedToolsEnabled = AdvancedToolsEnabled,
             Theme = Theme
         };
         IsBusy = true;
@@ -1559,7 +1530,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     }
     private void NotifyAllSettings()
     {
-        foreach (var property in new[] { nameof(RetentionDays), nameof(UseRetention7), nameof(UseRetention30), nameof(UseRetention90), nameof(CleanupRetentionButtonText), nameof(AutomaticBackup), nameof(UseRecycleBin), nameof(ScanRoamingData), nameof(ScanLocalData), nameof(ScanUserProfile), nameof(AdvancedFeaturesEnabled), nameof(AdvancedToolsEnabled), nameof(AdvancedToolsDisabled), nameof(Theme) }) OnPropertyChanged(property);
+        foreach (var property in new[] { nameof(RetentionDays), nameof(UseRetention7), nameof(UseRetention30), nameof(UseRetention90), nameof(CleanupRetentionButtonText), nameof(AutomaticBackup), nameof(UseRecycleBin), nameof(ScanRoamingData), nameof(ScanLocalData), nameof(ScanUserProfile), nameof(Theme) }) OnPropertyChanged(property);
     }
     private void RefreshCursorState()
     {

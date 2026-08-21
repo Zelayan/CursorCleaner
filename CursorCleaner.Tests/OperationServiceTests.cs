@@ -391,8 +391,6 @@ public sealed class OperationServiceTests
         Assert.AreEqual(30, settings.RetentionDays);
         Assert.IsTrue(settings.AutomaticBackup);
         Assert.IsTrue(settings.UseRecycleBin);
-        Assert.IsFalse(settings.AdvancedToolsEnabled);
-        Assert.IsFalse(settings.AdvancedFeaturesEnabled);
         Assert.AreEqual(CleanerTheme.System, settings.Theme);
         var log = Directory.GetFiles(logDirectory).Single();
         StringAssert.Contains(await File.ReadAllTextAsync(log), "settings.load");

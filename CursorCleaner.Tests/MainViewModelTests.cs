@@ -105,7 +105,6 @@ public sealed class MainViewModelTests
             StringAssert.Contains(viewModel.StaleCleanupSummaryText, "可从 Cursor 数据中移除");
             Assert.AreEqual("清理 30 天前的数据", viewModel.CleanupRetentionButtonText);
             Assert.IsTrue(viewModel.CleanupStaleSessionsCommand.CanExecute(null));
-            Assert.IsFalse(viewModel.AdvancedFeaturesEnabled);
 
             viewModel.RetentionDays = 90;
             Assert.IsFalse(viewModel.HasStaleSessions);
@@ -235,7 +234,7 @@ public sealed class MainViewModelTests
     }
 
     [TestMethod]
-    public async Task DeleteSelectedSessions_SuccessfulSqliteSuggestsOptimizeWithoutAdvancedTools()
+    public async Task DeleteSelectedSessions_SuccessfulSqliteSuggestsOptimize()
     {
         await RunStaAsync(async () =>
         {
@@ -270,13 +269,12 @@ public sealed class MainViewModelTests
                 sqlite: sqlite);
 
             await viewModel.ScanForTestingAsync();
-            Assert.IsFalse(viewModel.AdvancedToolsEnabled);
             await viewModel.DeleteSelectedSessionsCommand.ExecuteAsync(new ArrayList { session });
 
             Assert.IsTrue(viewModel.SuggestDatabaseOptimize);
             Assert.IsTrue(viewModel.OptimizeSuggestedDatabaseCommand.CanExecute(null));
             StringAssert.Contains(dialogs.LastMessage!, "可选择优化数据库");
-            Assert.IsFalse(viewModel.VacuumCommand.CanExecute(null));
+            Assert.IsTrue(viewModel.VacuumCommand.CanExecute(null));
         });
     }
 
@@ -454,7 +452,6 @@ public sealed class MainViewModelTests
             Assert.AreEqual(1, viewModel.SessionVisibleCount);
             Assert.AreEqual("会话", viewModel.Sessions[0].Title);
             Assert.IsTrue(viewModel.HasScanResult);
-            Assert.IsFalse(viewModel.AdvancedFeaturesEnabled);
         });
     }
 
@@ -681,21 +678,6 @@ public sealed class MainViewModelTests
     }
 
     [TestMethod]
-    public void AdvancedFlags_ClampHiddenPagesToSettings()
-    {
-        using var viewModel = CreateViewModel(new FixedScanner(Result()), new ScanResultStore(), new FixedWorkspaceAnalyzer([]), new FixedSessionAnalyzer([]));
-        viewModel.AdvancedFeaturesEnabled = true;
-        viewModel.SelectedPage = 3;
-        viewModel.AdvancedFeaturesEnabled = false;
-        Assert.AreEqual(5, viewModel.SelectedPage);
-
-        viewModel.AdvancedToolsEnabled = true;
-        viewModel.SelectedPage = 4;
-        viewModel.AdvancedToolsEnabled = false;
-        Assert.AreEqual(5, viewModel.SelectedPage);
-    }
-
-    [TestMethod]
     public async Task CleanupLegacySqliteBackups_ConfirmsAndLeavesRollingBackup()
     {
         await RunStaAsync(async () =>
@@ -711,7 +693,6 @@ public sealed class MainViewModelTests
                 new FixedSessionAnalyzer([]),
                 dialogs: dialogs,
                 backup: backup);
-            viewModel.AdvancedToolsEnabled = true;
 
             await viewModel.CleanupLegacySqliteBackupsCommand.ExecuteAsync();
 

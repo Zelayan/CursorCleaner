@@ -45,13 +45,10 @@
           <Button Content="历史会话" Command="{Binding NavigateCommand}" CommandParameter="1" Classes="nav"
                   Classes.selected="{Binding SelectedPage, Converter={StaticResource PageVisibilityConverter}, ConverterParameter=1}"/>
           <Button Content="工作区" Command="{Binding NavigateCommand}" CommandParameter="2" Classes="nav"
-                  IsVisible="{Binding AdvancedFeaturesEnabled}"
                   Classes.selected="{Binding SelectedPage, Converter={StaticResource PageVisibilityConverter}, ConverterParameter=2}"/>
           <Button Content="空间分析" Command="{Binding NavigateCommand}" CommandParameter="3" Classes="nav"
-                  IsVisible="{Binding AdvancedFeaturesEnabled}"
                   Classes.selected="{Binding SelectedPage, Converter={StaticResource PageVisibilityConverter}, ConverterParameter=3}"/>
-          <Button Content="高级工具" Command="{Binding NavigateCommand}" CommandParameter="4" Classes="nav"
-                  IsVisible="{Binding AdvancedToolsEnabled}"
+          <Button Content="数据库" Command="{Binding NavigateCommand}" CommandParameter="4" Classes="nav"
                   Classes.selected="{Binding SelectedPage, Converter={StaticResource PageVisibilityConverter}, ConverterParameter=4}"/>
           <Button Content="设置" Command="{Binding NavigateCommand}" CommandParameter="5" Classes="nav"
                   Classes.selected="{Binding SelectedPage, Converter={StaticResource PageVisibilityConverter}, ConverterParameter=5}"/>
@@ -413,7 +410,7 @@
           </StackPanel>
         </Grid>
 
-        <!-- 4 高级工具 -->
+        <!-- 4 数据库 -->
         <Grid IsVisible="{Binding SelectedPage, Converter={StaticResource PageVisibilityConverter}, ConverterParameter=4}">
           <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
@@ -421,7 +418,7 @@
             <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
           </Grid.RowDefinitions>
-          <TextBlock Text="高级工具" Classes="pageTitle"/>
+          <TextBlock Text="数据库" Classes="pageTitle"/>
           <Border Grid.Row="1" Classes="card" Margin="0,0,0,12" Background="{DynamicResource WarningBackgroundBrush}">
             <TextBlock Text="SQLite VACUUM 会改写数据库文件。必须关闭 Cursor；执行前会强制在线备份。结构不认识或备份失败时不会写入。" TextWrapping="Wrap" Foreground="{DynamicResource WarningBrush}"/>
           </Border>
@@ -485,21 +482,6 @@
                     <CheckBox Content="{Binding ScanLocalLabel}" IsChecked="{Binding ScanLocalData, Mode=TwoWay}"/>
                     <CheckBox Content="{Binding ScanUserProfileLabel}" IsChecked="{Binding ScanUserProfile, Mode=TwoWay}"/>
                     <TextBlock Text="正在刷新范围" IsVisible="{Binding IsScopeRefreshing}" Classes="muted"/>
-                  </StackPanel>
-                </Grid>
-              </Border>
-              <Border Classes="card" Margin="0,0,0,10">
-                <Grid>
-                  <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="180"/>
-                    <ColumnDefinition Width="*"/>
-                  </Grid.ColumnDefinitions>
-                  <TextBlock Text="高级功能" Classes="sectionHeader"/>
-                  <StackPanel Grid.Column="1">
-                    <CheckBox Content="显示高级功能" IsChecked="{Binding AdvancedFeaturesEnabled, Mode=TwoWay}"/>
-                    <TextBlock Text="开启后显示工作区和空间分析页。默认首页已可按 7/30/90 天清理旧会话，无需打开此开关。" Classes="muted" TextWrapping="Wrap" Margin="22,0,0,8"/>
-                    <CheckBox Content="启用 SQLite 高级工具" IsChecked="{Binding AdvancedToolsEnabled, Mode=TwoWay}"/>
-                    <TextBlock Text="开启后显示高级工具页，可选择具体数据库并维护备份。清理 SQLite 记录后，首页也会提供可选的数据库优化。" Classes="muted" TextWrapping="Wrap" Margin="22,0,0,0"/>
                   </StackPanel>
                 </Grid>
               </Border>
